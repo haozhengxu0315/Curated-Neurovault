@@ -1,0 +1,2428 @@
+---
+title: "Neurovault Image Preprocessing Pipeline"
+author: "Haozheng Xu, Simon Vandekar"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: cosmo
+    highlight: tango
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+---
+
+# Overview
+
+
+[NeuroVault](https://neurovault.org/), is an open repository for sharing statistical maps, parcellations, and atlases of the human brain. Scientists can upload the brain images that they use for their studies to the online repository, to allow for interactive visualization of images while also contributing data entries for meta-analysis.
+
+The images in Neurovault are highly heterogeneous and susceptible to human reporting errors in manually enter image metadata.
+This document automatically curates the Neurovault repository to produce a final dataset that is amenable to voxel-level meta-analysis.
+Here, we develop and run a preprocessing pipeline to ensure the Neurovault repository entries correspond to group-level statistical images and that images are registered to a common template (MNI 2mm). Details of preprocessing are described below. As a final step, we convert the images to effect sizes (the robust effect size index; RESI) and perform statistical analysis to remove outliers.
+
+NeuroVault is living growing database of images. This preprocessing pipeline is automatically run on the first of each month to build a comprehensive preprocessed dataset that is freely available for download.
+The curated dataset is available on [Zenodo](XX). In our [preprint](XX), we demonstrate the utility of the curated dataset through unsupervised and supervised meta-analyses.
+This document and the dataset were last updated on `r Sys.Date()`.
+
+
+
+
+#  Download the Neurovault data
+
+
+```{r setup, message=FALSE, warning = FALSE, include=FALSE}
+# ============================================================================
+# LIBRARY IMPORTS
+# ============================================================================
+library(parallel)
+library(RNifti)
+library(pbj)
+library(abind)
+library(dplyr)
+library(table1)
+library(GGally)
+library(ggplot2)
+library(httr)
+library(jsonlite)
+library(ComplexUpset)
+library(tidyr)
+library(forcats)
+library(grid)
+library(neurobase)
+library(gridGraphics)
+library(cowplot)
+library(GGally)
+library(scales)
+library(rlang)
+library(RNifti)
+library(pbapply)
+library(RESI)
+library(stringr)
+library(reactable)
+library(nlme)
+library(plotly)
+library(knitr)
+library(kableExtra)
+library(papayaWidget)
+library(lmtest)
+library(sandwich)
+library(gridExtra)
+
+# ============================================================================
+# KNITR OPTIONS
+# ============================================================================
+knitr::knit_hooks$set(GPs=function(before, options, envir){
+  if (before){
+    cex=1.5
+    par(mgp=c(1.8,.7,0), lwd=2, lend=2,
+        cex.lab=cex, cex.axis=cex, cex.main=1*cex,
+        mar=c(2.8,3,1.8,.5), bty='l', oma=c(0,0,2,0))}
+})
+knitr::opts_chunk$set(echo = TRUE, fig.height = 7.5, fig.width = 7.5, GPs=TRUE, cache=FALSE)
+
+# ============================================================================
+# FSL AND MNI TEMPLATE PATHS
+# ============================================================================
+# MNI Template image for registration (2mm isotropic)
+template = "/usr/local/fsl/data/standard/MNI152_T1_2mm_brain.nii.gz"
+template_mask = "/usr/local/fsl/data/standard/MNI152_T1_2mm_brain_mask.nii.gz"
+
+# ============================================================================
+# MASK FILES AND PATHS
+# ============================================================================
+# Gray and white matter masks for brain coverage analysis
+gm_mask <- "/media/disk2/ree/masks/grey_matter_binary_mask.nii.gz"
+wm_mask <- "/media/disk2/ree/masks/white_matter_binary_mask.nii.gz"
+# Brain mask (2mm isotropic MNI space)
+mask_2mm_file <- "/media/disk2/ree/masks/brain_binary_mask.nii.gz"
+mask_2mm_file_complement <- "/media/disk2/ree/masks/brain_binary_mask_complement.nii.gz"
+# Non-brain mask: excludes the ventricles
+# Created with: c3d brain_binary_mask_complement.nii.gz -holefill 0 0 -o nonbrain_mask.nii.gz
+# Eroded by 3 voxels: c3d nonbrain_mask.nii.gz -erode 1 3x3x3vox -o nonbrain_3vox_eroded_mask.nii.gz
+nonbrain_mask <- "/media/disk2/ree/masks/nonbrain_mask.nii.gz"
+nonbrain_eroded_mask <- "/media/disk2/ree/masks/nonbrain_3vox_eroded_mask.nii.gz"
+
+# ============================================================================
+# EXTERNAL TOOLS
+# ============================================================================
+# Convert 3D (c3d) binary for image processing
+c3d_bin <- "/usr/local/c3d-1.1.0-Linux-x86_64/bin/c3d"
+
+# ============================================================================
+# COMPUTATION PARAMETERS
+# ============================================================================
+# Number of cores for parallel processing
+n_cores <- 24
+# Output directory for downloaded/processed images
+outdir = '/media/big/neurovault'
+# RDS output directory for saving datasets
+rds_dir <- "/media/disk2/ree/metadataset/rds"
+if (!dir.exists(rds_dir)) dir.create(rds_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ============================================================================
+# RDS FILE MANAGEMENT HELPER FUNCTIONS
+# ============================================================================
+# Get current year-month string for file naming (YYYY-MM format)
+get_date_suffix <- function() {
+  format(Sys.Date(), "%Y-%m")
+}
+
+# Check if file with current month exists, delete older versions, and return path
+get_monthly_rds_path <- function(base_name, dir = rds_dir) {
+  date_suffix <- get_date_suffix()
+  current_file <- file.path(dir, paste0(base_name, "_", date_suffix, ".rds"))
+  
+  # List all versions of this file
+  pattern <- paste0("^", base_name, "_[0-9]{4}-[0-9]{2}\\.rds$")
+  all_files <- list.files(dir, pattern = pattern, full.names = TRUE)
+  
+  # Delete older versions (keeping only current month's)
+  old_files <- all_files[all_files != current_file]
+  if (length(old_files) > 0) {
+    invisible(lapply(old_files, file.remove))
+  }
+  
+  return(current_file)
+}
+
+# Check if current month's RDS file exists and is recent
+rds_file_exists_this_month <- function(base_name, dir = rds_dir) {
+  current_file <- get_monthly_rds_path(base_name, dir = dir)
+  file.exists(current_file)
+}
+
+# Save to monthly-versioned RDS file
+save_monthly_rds <- function(data, base_name, dir = rds_dir) {
+  if (!dir.exists(dir)) dir.create(dir, showWarnings = FALSE, recursive = TRUE)
+  rds_path <- get_monthly_rds_path(base_name, dir = dir)
+  saveRDS(data, file = rds_path)
+  invisible(rds_path)
+}
+
+# Load monthly-versioned RDS file
+load_monthly_rds <- function(base_name, dir = rds_dir) {
+  rds_path <- get_monthly_rds_path(base_name, dir = dir)
+  if (file.exists(rds_path)) {
+    readRDS(rds_path)
+  } else {
+    NULL
+  }
+}
+```
+
+## Metadata download and exclusionary criteria
+
+The Neurovault metadata include manually entered information at the study- and image-level describing the type of data that were uploaded, including:
+
+* `analysis_level`: indicates whether the image is a group-level or individual-level statistical map.
+* `not_mni`: indicates whether the image is in MNI space.
+* `is_thresholded`: indicates whether the image is thresholded or unthresholded.
+* `map_type`: indicates the statistical type of the image (e.g., T, Z, F).
+* `modality`: indicates the imaging modality (e.g., structural, functional).
+* `perc_bad_voxels`: Proportion of voxels with 0 intensity or NaN values.
+* `perc_voxels_outside`: Proportion of voxels outside the brain.
+* `number_of_subjects`: Sample size of the study
+* `DOI`: The DOI for the publication associated with the repository entry.
+* `paper_url`: The URL for the publication associated with the repository entry.
+
+We download the Neurovault study-level and image-level metadata, then apply the following quality exclusionary criteria to the metadata to ensure uniformity of the group-level statistical images.
+<!-- These criteria help ensure uniformity across statistical maps and reduce noise from heterogeneity. -->
+
+-   Retain only group-level images, which represent group-level statistical maps rather than individual-level contrasts (`analysis_level == "group"`).
+-   Exclude images that are not in MNI space (`not_mni == FALSE`).
+-   Keep only unthresholded maps (`is_thresholded == FALSE`), which ensures all statistical values computed in the image are included. This avoids biased caused by only reporting significant results
+-   Restrict to statistical image types T and Z images, which are most commonly used in group-level inference. This step removes less frequently reported F images, and non-statistical images.
+-  Exclude those that have sample size of 0 or `NaN`.
+
+See Table 1 and Figure 1 for a summary of the intersection of these exclusionary criteria.
+
+```{r, getStudyLevelData, eval=TRUE,warning = FALSE}
+## This chunk would take some time, as it creates the file neurovaultMetadata, containing all the study-level images
+
+library(callr)
+
+# Check if data was already downloaded this month
+rds_file_path <- get_monthly_rds_path("neurovaultMetadata")
+file_exists_this_month <- file.exists(rds_file_path)
+
+if (!file_exists_this_month) {
+  # Run in background using callr::r - function saves results internally
+  download_and_save_metadata_fn <- function(rds_dir) {
+    library(httr)
+    library(jsonlite)
+    
+    # Helper function to get date suffix
+    get_date_suffix <- function() {
+      format(Sys.Date(), "%Y-%m")
+    }
+    
+    # Helper function to get monthly RDS path
+    get_monthly_rds_path <- function(base_name, dir = rds_dir) {
+      date_suffix <- get_date_suffix()
+      current_file <- file.path(dir, paste0(base_name, "_", date_suffix, ".rds"))
+      
+      pattern <- paste0("^", base_name, "_[0-9]{4}-[0-9]{2}\\.rds$")
+      all_files <- list.files(dir, pattern = pattern, full.names = TRUE)
+      
+      old_files <- all_files[all_files != current_file]
+      if (length(old_files) > 0) {
+        invisible(lapply(old_files, file.remove))
+      }
+      
+      return(current_file)
+    }
+    
+    Sys.setenv(CURL_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt")
+    httr::GET("https://api.github.com")
+    
+    url <- 'https://neurovault.org/api/collections/?format=json'
+    
+    nv = list()
+    i = 0
+    while (!is.null(url)) {
+      i = i + 1
+      cat(sprintf("[%s] Downloading collections batch %d\n", Sys.time(), i))
+      response <- GET(url, config(cainfo="/etc/ssl/certs/ca-certificates.crt"))
+      data <- content(response, "text")
+      json_data <- fromJSON(data, flatten = TRUE)
+      nv[[i]] = json_data$results
+      
+      url <- json_data[['next']]
+    }
+    nv = do.call(rbind, nv)
+    # subset to studies that have more than 0 images
+    nv = nv[nv$number_of_images>0,]
+    
+    # Save directly to versioned RDS file
+    if (!dir.exists(rds_dir)) dir.create(rds_dir, showWarnings = FALSE, recursive = TRUE)
+    rds_path <- get_monthly_rds_path("neurovaultMetadata")
+    saveRDS(nv, file = rds_path)
+    
+    cat(sprintf("[%s] Neurovault metadata saved to %s\n", Sys.time(), rds_path))
+  }
+  
+  # Start background process - DON'T WAIT for completion
+  logfiles = c('logfiles/neurovault_collection_download.log', 'logfiles/neurovault_collection_download.err')
+  unlink(logfiles)
+  bg_process <- callr::r(download_and_save_metadata_fn, args = list(rds_dir), stdout = logfiles[1], stderr=logfiles[2])
+  
+  message(sprintf("[%s] Download complete. Output saved to %s", 
+          Sys.time(), rds_file_path))
+} else {
+  # Load already downloaded metadata
+  nv <- load_monthly_rds("neurovaultMetadata")
+  message("Loaded previously downloaded metadata from ", rds_file_path)
+}
+```
+
+
+<!-- SNV: Excluded this for now. -->
+<!-- Table \@ref(tab:loadsNeuroVaultData_section1.1) includes a summary of some collection-level metadata. -->
+<!-- The full list of metadataset variable names is below in [](#appendix). No exclusionary criteria have been applied at this time. -->
+
+```{r loadsNeuroVaultData_section1.1,warning = FALSE, eval=FALSE}
+nv$DOIexists = factor(ifelse(is.na(nv$DOI), "No", "Yes"), levels=c('Yes', 'No'))
+nv$paperURLexists = factor(ifelse(is.na(nv$paper_url), "No", "Yes"), levels=c('Yes', 'No'))
+label(nv$paperURLexists) = "Paper URL exists"
+label(nv$number_of_images) = "Number of images"
+label(nv$DOIexists) = "DOI exists"
+table1(~number_of_images + DOIexists + paperURLexists, data = nv, caption = "Study-level metadata.")
+```
+
+```{r getImageLevelData_section1.1_download, eval=TRUE, warning = FALSE}
+
+## The following two chunks would take some time, as it extracts and downloads all the image-level data and creates the first image tabular dataset that we work with. More than 2 hours
+
+## May 2026: 10743 collections
+
+library(callr)
+api_cores = 4
+# Check if image list was already downloaded this month
+rds_file_path <- get_monthly_rds_path("imageList")
+file_exists_this_month <- file.exists(rds_file_path)
+
+if (!file_exists_this_month) {
+  # Define the download function to run in background - function saves results internally
+  download_and_save_image_list_fn <- function(collection_ids, n_cores, rds_dir) {
+    library(httr)
+    library(jsonlite)
+    library(parallel)
+    
+    # Ensure collection_ids is a proper character vector (fix for list coercion error)
+    if (is.list(collection_ids)) {
+      collection_ids <- unlist(collection_ids)
+    }
+    collection_ids <- as.character(collection_ids)
+    
+    cat(sprintf("[%s] [BG] Starting download with %d collection IDs\n", Sys.time(), length(collection_ids)))
+    
+    # Helper function to get monthly RDS path
+    get_monthly_rds_path <- function(base_name, dir = rds_dir) {
+      get_date_suffix <- function() {
+        format(Sys.Date(), "%Y-%m")
+      }
+      date_suffix <- get_date_suffix()
+      current_file <- file.path(dir, paste0(base_name, "_", date_suffix, ".rds"))
+      
+      pattern <- paste0("^", base_name, "_[0-9]{4}-[0-9]{2}\\.rds$")
+      all_files <- list.files(dir, pattern = pattern, full.names = TRUE)
+      
+      old_files <- all_files[all_files != current_file]
+      if (length(old_files) > 0) {
+        invisible(lapply(old_files, file.remove))
+      }
+      
+      return(current_file)
+    }
+    
+    # Download function with pagination support and error handling
+    download_collection_safe <- function(collection_id) {
+      tryCatch({
+        collection_id <- as.character(collection_id)
+        cat(sprintf("[%s] [BG] Downloading collection %s\n", Sys.time(), collection_id))
+        
+        url <- paste0("https://neurovault.org/api/collections/", collection_id, "/images/?format=json")
+        all_results <- list()
+        page <- 0
+        
+        # Paginate through all results
+        while (!is.null(url)) {
+          page <- page + 1
+          response <- GET(url, timeout(30))
+          
+          if (status_code(response) != 200) {
+            cat(sprintf("[%s] [BG] Collection %s page %s: HTTP %s\n", Sys.time(), collection_id, page, status_code(response)))
+            break
+          }
+          
+          data <- content(response, "text")
+          json_data <- fromJSON(data, flatten = TRUE)
+          
+          # Extract results from this page
+          if (!is.null(json_data$results) && is.data.frame(json_data$results) && nrow(json_data$results) > 0) {
+            all_results[[page]] <- json_data$results
+          }
+          
+          # Check for next page
+          url <- json_data[['next']]
+        }
+        
+        # Combine all pages
+        if (length(all_results) == 0) {
+          cat(sprintf("[%s] [BG] Collection %s: No results\n", Sys.time(), collection_id))
+          return(data.frame())
+        }
+        
+        result <- do.call(rbind, all_results)
+        
+        # Validate result is a dataframe
+        if (!is.data.frame(result)) {
+          cat(sprintf("[%s] [BG] Collection %s: invalid result type (%s)\n", Sys.time(), collection_id, class(result)[1]))
+          return(data.frame())
+        }
+        
+        cat(sprintf("[%s] [BG] Collection %s: OK (%s pages, %s total rows, %s cols)\n", Sys.time(), collection_id, page, nrow(result), ncol(result)))
+        return(result)
+        
+      }, error = function(e) {
+        cat(sprintf("[%s] [BG] Collection %s: ERROR - %s\n", Sys.time(), collection_id, e$message))
+        return(data.frame())
+      })
+    }
+    
+    # Download all collections
+    cat(sprintf("[%s] [BG] Starting mclapply", Sys.time(), n_cores))
+    image_list <- mclapply(collection_ids, download_collection_safe, mc.cores = n_cores)
+    
+    # Validate we got a list
+    if (!is.list(image_list)) {
+      stop(sprintf("ERROR: mclapply did not return a list, got %s", class(image_list)))
+    }
+    cat(sprintf("[%s] [BG] mclapply returned %d results\n", Sys.time(), length(image_list)))
+    
+    # Keep only data frames with >0 rows
+    cat(sprintf("[%s] [BG] Filtering dataframes with >0 rows\n", Sys.time()))
+    is_valid <- sapply(image_list, function(x) is.data.frame(x) && nrow(x) > 0)
+    valid_count <- sum(is_valid)
+    cat(sprintf("[%s] [BG] Valid dataframes: %d of %d\n", Sys.time(), valid_count, length(image_list)))
+    
+    if (valid_count == 0) {
+      stop("ERROR: No valid dataframes downloaded. Check collection_ids and API.")
+    }
+    
+    image_list <- image_list[is_valid]
+    
+    # Save list directly to versioned RDS file
+    if (!dir.exists(rds_dir)) dir.create(rds_dir, showWarnings = FALSE, recursive = TRUE)
+    rds_path <- get_monthly_rds_path("imageList")
+    
+    cat(sprintf("[%s] [BG] Saving image list with %d dataframes to %s\n", Sys.time(), length(image_list), rds_path))
+    saveRDS(image_list, file = rds_path, compress = "gzip")
+    
+    cat(sprintf("[%s] [BG] ✓ Image list saved successfully\n", Sys.time()))
+  }
+  
+  
+  if (is.null(nv) || nrow(nv) == 0) {
+    stop("ERROR: neurovaultMetadata is empty. Run getStudyLevelData chunk first.")
+  }
+  
+  # Extract and validate collection IDs
+  collection_ids <- nv$id
+  if (is.list(collection_ids)) {
+    collection_ids <- unlist(collection_ids)
+  }
+  collection_ids <- as.character(collection_ids)
+  
+  cat(sprintf("[%s] Extracted %d collection IDs\n", Sys.time(), length(collection_ids)))
+  
+  # Create logfiles directory if needed
+  logdir <- "logfiles"
+  if (!dir.exists(logdir)) dir.create(logdir, showWarnings = FALSE)
+  logfiles = c('logfiles/neurovault_download.log', 'logfiles/neurovault_download.err')
+  unlink(logfiles)
+  
+  # Start background process - DON'T WAIT for completion
+  bg_process <- callr::r(download_and_save_image_list_fn, 
+                            args = list(collection_ids, api_cores, rds_dir), 
+                            stdout = logfiles[1], 
+                            stderr = logfiles[2])
+  
+  message(sprintf("[%s] Background process started (PID: %s). Downloading %d collections. Output: %s", 
+            Sys.time(), length(collection_ids), logfiles[1]))
+} else {
+  # Load already downloaded list
+  image_list <- load_monthly_rds("imageList")
+  message("Loaded previously downloaded image list from ", rds_file_path)
+}
+```
+
+
+
+```{r getImageLevelData_section1.1_merge, eval=TRUE}
+# Check if merged image-level data already exists this month
+rds_file_path <- get_monthly_rds_path("fullimageMetadata")
+file_exists_this_month <- file.exists(rds_file_path)
+
+#res = unlist(by(images$collection_id, images$collection_id, length)); res = data.frame(collection_id = names(res), numberinImages=res) 
+#test = merge(res, nv[, c('id', 'number_of_images')], by.x='collection_id', by.y='id')
+
+if (!file_exists_this_month) {
+  
+  if (is.null(image_list) || length(image_list) == 0) {
+    stop("ERROR: imageList is empty. Run getImageLevelData_section1.1_download chunk first and wait for it to complete.")
+  }
+  
+  cat(sprintf("[%s] Loaded image list with %d dataframes\n", Sys.time(), length(image_list)))
+  
+  # Find common column names across all dataframes (columns in ALL collections)
+  cat(sprintf("[%s] Analyzing column overlap across %d collections\n", Sys.time(), length(image_list)))
+  all_colnames <- lapply(image_list, colnames)
+  
+  # Columns that appear in ALL collections
+  # SNV: This excludes important columns
+  # common_cols <- Reduce(intersect, all_colnames)
+  # cat(sprintf("[%s] Found %d columns in ALL collections\n", Sys.time(), length(common_cols)))
+  
+  # Find columns that appear in at least 80% of collections
+  col_freq <- table(unlist(all_colnames))
+  common_cols <- names(col_freq)[col_freq >= 0.8 * length(image_list)]
+  cat(sprintf("[%s] Fallback: %d columns in ≥80%% of collections\n", Sys.time(), length(common_cols)))
+  
+  # Subset each dataframe to common columns only
+ cat(sprintf("[%s] Subsetting to %d common columns\n", Sys.time(), length(common_cols)))
+  image_list <- lapply(image_list, function(df) {
+    # Get columns that exist in this dataframe
+    cols_exist <- intersect(common_cols, colnames(df))
+    
+    # Get missing columns
+    cols_missing <- setdiff(common_cols, colnames(df))
+    
+    # Start with existing columns
+    result <- df[, cols_exist, drop = FALSE]
+    
+    # Add missing columns filled with NA
+    if (length(cols_missing) > 0) {
+      result[, cols_missing] <- NA
+    }
+    
+    # Reorder to match common_cols order
+    result[, common_cols, drop = FALSE]
+  })
+  
+  # Combine dataframes using rbind (much faster than merge)
+  cat(sprintf("[%s] Combining %d dataframes via rbind...\n", Sys.time(), length(image_list)))
+  start_time <- Sys.time()
+  images <- do.call(rbind, image_list)
+  elapsed <- difftime(Sys.time(), start_time, units = "secs")
+  cat(sprintf("[%s] rbind complete in %.1f sec: %d rows × %d columns\n", 
+              Sys.time(), elapsed, nrow(images), ncol(images)))
+  
+  # Sort all columns by missingness
+  cat(sprintf("[%s] Computing column completeness for %d columns\n", Sys.time(), ncol(images)))
+  col_miss <- colMeans(is.na(images))
+  col_miss = sort(col_miss)
+  col_keep <- names(col_miss)[col_miss < 0.8]
+  images <- images[, col_keep]
+  
+  
+  # Save to versioned RDS file
+  if (!dir.exists(rds_dir)) dir.create(rds_dir, showWarnings = FALSE, recursive = TRUE)
+  rds_file_path <- get_monthly_rds_path("fullimageMetadata")
+  
+  cat(sprintf("[%s] Saving merged data to %s\n", Sys.time(), rds_file_path))
+  saveRDS(images, file = rds_file_path, compress = "gzip")
+  
+  cat(sprintf("[%s] ✓ Full image metadata saved successfully\n", Sys.time()))
+} else {
+  # Load already merged metadata
+  images <- load_monthly_rds("fullimageMetadata")
+  message("Loaded previously merged image metadata from ", rds_file_path)
+}
+```
+
+
+<!-- SNV: I split the table and figure into two chunks so they can be referenced separately. -->
+```{r table1_section1_1, eval = TRUE, fig.height= 10, fig.width=10, warning=FALSE}
+images <- images %>% mutate(
+  image_type      = factor(image_type,      levels = names(sort(table(image_type),      decreasing = TRUE))),
+  map_type        = factor(map_type,        levels = names(sort(table(map_type),        decreasing = TRUE))),
+  analysis_level  = factor(analysis_level,  levels = names(sort(table(analysis_level),  decreasing = TRUE))),
+  is_thresholded  = factor(is_thresholded,  levels = names(sort(table(is_thresholded),  decreasing = TRUE))),
+  not_mni         = factor(not_mni,         levels = names(sort(table(not_mni),         decreasing = TRUE)))
+)
+
+table1Form = ~ number_of_subjects + modality + image_type + map_type + analysis_level + is_thresholded + not_mni + perc_bad_voxels + perc_voxels_outside
+
+table1(table1Form,
+       data = images,
+       caption = "Table 1: Neurovault image-level metadata summary.")
+```
+Table 1 summarizes the full NeuroVault repository prior to any exclusions
+(N = `r nrow(images)`). Several patterns are worth noting. The repository
+is dominated by single-subject images and meta-analytic maps; group-level
+images — the target of this pipeline — comprise only
+`r sprintf("%.1f%%", 100 * mean(images$analysis_level == "group", na.rm=TRUE))`
+of the total. The most common map types are non-statistical maps such as
+`univariate-beta map` and `variance`; T and Z maps together account for a
+minority of all images. A large proportion of images have no recorded sample
+size (`r sprintf("%.1f%%", 100 * mean(is.na(images$number_of_subjects)))`
+missing), reflecting the manually curated nature of the repository.
+The high median `perc_bad_voxels` reflects expected zero-valued voxels
+outside the brain mask rather than data corruption.
+
+
+```{r figure1, eval = TRUE, fig.height=10, fig.width=10, warning=FALSE, fig.cap="Figure 1: Intersection of NeuroVault image-level exclusionary criteria."}
+# SNV: Warning mapping missing to FALSE in upset plot is suppressed.
+library(ComplexUpset)
+## UpSet table
+images$binarized_group_level <- ifelse(images$analysis_level == "group", TRUE, FALSE)
+images$binarized_map_type <- ifelse(images$map_type == "T map" | images$map_type == "Z map", TRUE, FALSE)
+images$unthresholded <- ifelse(images$is_thresholded == FALSE, TRUE, FALSE)
+images$mni <- ifelse(images$not_mni == FALSE, TRUE, FALSE)
+images$nonzero_sample <- ifelse(is.na(images$number_of_subjects) | images$number_of_subjects<=0, FALSE, TRUE)
+
+images_clean <- images %>%
+  transmute(
+    "Group-level analysis" = as.logical(binarized_group_level),
+    "T/Z map"  = as.logical(binarized_map_type),
+    "Unthresholded" = as.logical(unthresholded),
+    "MNI space" = as.logical(mni),
+    "Nonzero sample" = as.logical(nonzero_sample)
+  )
+
+upset(
+  images_clean,
+  intersect = c(
+    "Group-level analysis",
+    "T/Z map",
+    "Unthresholded",
+    "MNI space",
+    'Nonzero sample'
+  ),
+  name='Group',
+  min_size = 50,
+  base_annotations = list(
+    "Intersection size" = intersection_size(
+      text = list(
+        angle = 90,
+        vjust = 0.5,
+        hjust = -0.02
+      )
+    )
+  )
+)
+# SNV: clean up larger unused objects
+rm(images_clean, image_list)
+```
+Figure 1 shows the an UpSet plot showing the intersection of the five 
+exclusionary criteria applied to the raw NeuroVault image metadata. Each column 
+in the upper bar chart represents a unique combination of criteria, with the 
+bar height indicating how many images fall into that combination. The dot matrix
+below each bar shows which criteria are active — filled dots connected by a 
+vertical line indicate criteria that are *simultaneously* satisfied. The 
+horizontal bars on the left show the total number of images satisfying each 
+criterion individually (set size), regardless of the others. The final retained images satisfy all five criteria simultaneously. See **Table 2** below for summary statistics after exclusion.
+
+**Note**:
+
+1. The `analysis_level` variable has other types of data, and group-level images make up less than 10% of data. 
+2.  Including only T and Z maps removes approximately 70% of the data. 
+
+```{r sample_size_check, echo=FALSE}
+n_extreme <- sum(images$number_of_subjects > 10000, na.rm = TRUE)
+max_n <- max(images$number_of_subjects, na.rm = TRUE)
+images <- images[images$number_of_subjects <= 10000, ]
+```
+
+3. `r n_extreme` images have a reported sample size greater than 10,000
+(maximum: `r format(max_n, big.mark=",")`), which may reflect metadata entry
+errors. Thus, implausibly large values will be flagged and addressed here.
+
+
+
+```{r filteringImages_section1.1, eval = TRUE}
+# SNV: I deleted reloading the dataset, here
+images_before <- nrow(images)
+# subset to group-level analysis
+images = images[ which(images$analysis_level=='group'), ]
+# subset to unthresholded images
+images = images[which(images$is_thresholded==FALSE),]
+# Including only T and Z map types
+images = images[images$map_type %in% c("T map", "Z map"), ]
+# Exclude all not mni
+images = images[which(images$not_mni == FALSE), ]
+# Exclude sample size 0
+images <- images[which(!is.na(images$number_of_subjects) & images$number_of_subjects>0),]
+
+table1(table1Form, data = images, caption = "Table 2: Summary statistics after metadata exclusions.")
+```
+After applying these exclusions, the dataset is reduced from
+`r format(images_before, big.mark=",")` to `r format(nrow(images), big.mark=",")`
+images (Table 2). The retained images are exclusively group-level, unthresholded
+T and Z maps in MNI space with a valid nonzero sample size. As expected, variables
+used as exclusionary criteria — `analysis_level`, `is_thresholded`, `not_mni`, and
+`map_type` — show no remaining variation, confirming the filters were applied
+correctly. The dataset is dominated by fMRI-BOLD images
+(`r sprintf("%.1f%%", 100 * mean(images$modality == "fMRI-BOLD", na.rm=TRUE))`),
+with a median sample size of `r median(images$number_of_subjects, na.rm=TRUE)`
+subjects. The mean sample size
+(`r round(mean(images$number_of_subjects, na.rm=TRUE))`) is notably larger than
+the median, suggesting a small number of studies with disproportionately large
+sample sizes that will be addressed in the outlier detection step in Section 6.
+
+
+## Imaging data download
+
+Here, we download Nifti images from each NeuroVault collection after applying the metadata exclusions.
+After preparing local file paths, it checks for missing files and downloads them in parallel using 36 cores.
+
+```{r section1.2 Download Image data, warning=FALSE}
+
+## This chunk would take some time, as it downloads the images to local directories, to allow further work on the images.
+
+
+library(callr)
+# download the images
+outdir = '/media/big/neurovault'
+images$localfile = gsub('http://neurovault.org/media/images', outdir, images$file)
+
+# creates the directories
+invisible(capture.output(lapply(unique(dirname(images$localfile)), dir.create, showWarnings=FALSE, recursive = TRUE)))
+
+# Actually download the images, here, if they aren't already
+# downloaded. I am not sure if there are usage limits on
+# neurovault. This parallel call would probably be a problem
+# if there is. There were issues the first time.
+images$download = !file.exists(images$localfile)
+
+# Define the download function
+download_images_fn <- function(url_vec, destfile_vec, n_cores) {
+  library(parallel)
+  
+  downloadFile = function(url, destfile){ 
+    tryCatch(download.file(url=url, destfile=destfile), error=function(e){NA})
+  }
+  
+  invisible(mcmapply(downloadFile, url=url_vec, destfile=destfile_vec, mc.cores = n_cores))
+}
+
+# Create logfiles directory if needed
+logdir <- "logfiles"
+if (!dir.exists(logdir)) dir.create(logdir, showWarnings = FALSE)
+logfiles = c('logfiles/image_download.log', 'logfiles/image_download.err')
+unlink(logfiles)
+
+# Run and wait for completion
+cat(sprintf("[%s] Starting image download (%d files)...\n", Sys.time(), sum(images$download==TRUE)))
+result <- callr::r(download_images_fn, 
+                   args = list(images$file[images$download==TRUE], 
+                              images$localfile[images$download==TRUE], 
+                              n_cores),
+                   stdout = logfiles[1],
+                   stderr = logfiles[2])
+
+cat(sprintf("[%s] ✓ Download completed. Output: %s\n", Sys.time(), logfiles[1]))
+# recheck what files exist
+images$download = !file.exists(images$localfile)
+# SNV: Haozheng, I added this, but it is not documented. Excludes failed downloads
+images = images[ !images$download,]
+```
+
+#  Image derived exclusionary criteria
+
+After downloading the images, we compute image dimensions (`imgdim`), voxel dimensions (`voxdim`), number of nonzero voxels (`nvox`), image intensity range (`range`), and orientation from the Nifti images. The image and voxel dimensions are used to compute the physical dimensions of each image in millimeters. 
+We screen for duplicate images based on both the qualitative and quantitative aspects, including the file's basename `perc_bad_voxels`, `imgdim`, `voxeldim`, `nvox`, `range`, and `bounding_box`. It would be rare for two different images to have exact identical values across all these metrics, especially `bounding_box`.
+After identifying duplicates, we check whether the image dimensions in mm are within 2.5% of the MNI template image.
+Finally, we check the image range; if it is less than 0.01, we exclude the image (Figure 2).
+This threshold was chosen because for images where the maximum and minimum intensity values differ by less than 0.01, they contain effectively no signal variation, and are therefore unlikely to represent valid statistical maps.
+We do not exclude based on large ranges because the test statistic under the alternative converges to infinity as the sample size gets large.
+Further effect size based exclusionary criteria are applied below.
+Tables 4 and 5 show the dataset before and after these exclusionary criteria, respectively.
+
+
+```{r 2.1, warning=FALSE}
+library(callr)
+
+# Check if image dimensions/voxels metadata was already computed this month
+rds_file_path <- get_monthly_rds_path("imageMetadataWithDimensions")
+file_exists_this_month <- file.exists(rds_file_path)
+
+if (!file_exists_this_month) {
+  # Define the function to compute image dimensions - runs in background
+  compute_and_save_image_dimensions_fn <- function(rds_dir, images, n_cores, c3d_bin) {
+    library(parallel)
+    
+    # Helper function to get monthly RDS path
+    get_monthly_rds_path <- function(base_name, dir = rds_dir) {
+      get_date_suffix <- function() {
+        format(Sys.Date(), "%Y-%m")
+      }
+      date_suffix <- get_date_suffix()
+      current_file <- file.path(dir, paste0(base_name, "_", date_suffix, ".rds"))
+      
+      pattern <- paste0("^", base_name, "_[0-9]{4}-[0-9]{2}\\.rds$")
+      all_files <- list.files(dir, pattern = pattern, full.names = TRUE)
+      
+      old_files <- all_files[all_files != current_file]
+      if (length(old_files) > 0) {
+        invisible(lapply(old_files, file.remove))
+      }
+      
+      return(current_file)
+    }
+    
+    # Helper function to extract value by keyword from a string
+    extract_info_field <- function(lines, keyword) {
+      val <- sapply(lines, function(x) {
+        first_line <- x[1]
+        splt <- strsplit(first_line, split = ";")[[1]]
+        match <- grep(keyword, splt, value = TRUE)
+        if (length(match) > 0) {
+          return(trimws(sub(paste0("^.*", keyword, "\\s*=\\s*"), "", match[1])))
+        } else {
+          return(NA)
+        }
+      })
+      return(val)
+    }
+    
+    # Get image dimensions and voxel info
+    cat(sprintf("[%s] [BG] Computing image dimensions with c3d -info...\n", Sys.time()))
+    cmd = paste(c3d_bin, images$localfile, '-info')
+    voxdim = mclapply(cmd, system, intern=TRUE, mc.cores=n_cores)
+    images$voxdim = unlist(lapply(voxdim, function(x){splt = strsplit(x[1], split = ';')[[1]]; splt[grep('vox', splt)] }))
+    images$imgdim = unlist(lapply(voxdim, function(x){splt = strsplit(x[1], split = ';')[[1]]; splt[grep('dim', splt)] }))
+    images$voxdim <- trimws(images$voxdim)
+    images$imgdim <- trimws(images$imgdim)
+    cat(sprintf("[%s] [BG] Image dimensions computed\n", Sys.time()))
+    
+    # Count non-zero voxels
+    cat(sprintf("[%s] [BG] Counting non-zero voxels with c3d -threshold...\n", Sys.time()))
+    cmd_vox <- paste(c3d_bin, images$localfile, '-threshold 0 0 0 1 -voxel-sum')
+    nvox <- unlist(mclapply(cmd_vox, system, intern = TRUE, mc.cores = n_cores))
+    images$nvox <- as.numeric(gsub("[^0-9.]", "", nvox))
+    cat(sprintf("[%s] [BG] Non-zero voxel count complete\n", Sys.time()))
+    
+    # Get orientation, range, and bounding box from `-info` output
+    cat(sprintf("[%s] [BG] Extracting orientation, range, and bounding box...\n", Sys.time()))
+    cmd_info <- paste(c3d_bin, images$localfile, '-info')
+    info <- mclapply(cmd_info, system, intern = TRUE, mc.cores = n_cores)
+    
+    images$orient <- extract_info_field(info, "orient")
+    images$range <- extract_info_field(info, "range")
+    images$bounding_box <- extract_info_field(info, "bb")
+    images$voxdim <- trimws(gsub("vox = ", "", images$voxdim))
+    images$imgdim <- trimws(gsub("Image #1: dim = ", "", images$imgdim))
+    
+    # Save to versioned RDS file
+    if (!dir.exists(rds_dir)) dir.create(rds_dir, showWarnings = FALSE, recursive = TRUE)
+    rds_path <- get_monthly_rds_path("imageMetadataWithDimensions")
+    
+    cat(sprintf("[%s] [BG] Saving enhanced metadata to %s\n", Sys.time(), rds_path))
+    saveRDS(images, file = rds_path, compress = "gzip")
+    
+    cat(sprintf("[%s] [BG] ✓ Image dimension metadata saved successfully\n", Sys.time()))
+  }
+  
+  # Create logfiles directory if needed
+  logdir <- "logfiles"
+  if (!dir.exists(logdir)) dir.create(logdir, showWarnings = FALSE)
+  logfiles = c('logfiles/c3d_dimensions.log', 'logfiles/c3d_dimensions.err')
+  unlink(logfiles)
+  
+  # Start background process - DON'T WAIT for completion
+  bg_process <- callr::r(compute_and_save_image_dimensions_fn, 
+                            args = list(rds_dir, images, n_cores, c3d_bin), 
+                            stdout = logfiles[1], 
+                            stderr = logfiles[2])
+  
+  message(sprintf("[%s] Background process started (PID: %s). Computing image dimensions. Output: %s", 
+            Sys.time(), logfiles[1]))
+} else {
+  # Load already computed metadata
+  images <- load_monthly_rds("imageMetadataWithDimensions")
+  message("Loaded previously computed image dimensions from ", rds_file_path)
+}
+```
+
+```{r 2.2_duplicates_removal, warning=FALSE}
+# Add basename(localfile) 
+images$localfile_base = basename(as.character(images$localfile))
+cand_keys <- c("perc_bad_voxels","range","bounding_box",
+               "nvox","imgdim","localfile_base")
+
+# Build a key-only copy and normalize any list columns
+keyDF <- images[, cand_keys]
+
+# DEDUPLICATION
+images$duplicated <- duplicated(keyDF)
+
+
+# SNV: These are the duplicates
+reactable(images[duplicated(keyDF) | duplicated(keyDF, fromLast = TRUE), c('collection', 'id', cand_keys)])
+
+# SNV: clean up workspace
+rm(keyDF)
+```
+
+
+```{r 2.3, eval = TRUE}
+# compute dim_mm by multiplying imgdim with voxdim after converting to numeric values
+imgdims = lapply(gsub('\\]', ')', gsub('\\[', 'c(', as.character(images$imgdim))), function(x) eval(parse(text=x)))
+voxdims = lapply(gsub('\\]', ')', gsub('\\[', 'c(', as.character(images$voxdim))), function(x) eval(parse(text=x)))
+dims_mat = t(mapply(function(x,y){ x*y}, imgdims, voxdims))
+colnames(dims_mat) <- c("dim_x", "dim_y", "dim_z")
+
+# Split dim_mm into x, y, z components
+# SNV: dim_mm was not defined and only existed because it was loading an old dataset version.
+images$dim_mm = apply(dims_mat, 1, function(x) paste(x, collapse = "*"))
+
+
+# Compute ratios
+ratio_xy <- dims_mat[,1] / dims_mat[,2]
+ratio_xz <- dims_mat[,1] / dims_mat[,3]
+ratio_yz <- dims_mat[,2] / dims_mat[,3]
+
+
+# Define reference ratios (from MNI: 182x218x182)
+ref_xy <- 182 / 218       # ≈ 0.8349
+ref_xz <- 1               # since x = z
+ref_yz <- 218 / 182       # ≈ 1.1978
+
+images[, paste('log10', c('ratio_xy', 'ratio_xz', 'ratio_yz'), sep = '_')] <- cbind(ratio_xy/ref_xy, ratio_xz/ref_xz, ratio_yz/ref_yz)
+
+images[, c('ratio_x', 'ratio_y', 'ratio_z') ] <- sweep(dims_mat, 2, c(182, 218, 182), FUN = "/")
+
+
+# Reference thresholds by dimension
+ref_thresholds <- list(
+  ratio_x = c(0.75, 1.25),
+  ratio_y = c(0.75, 1.25),
+  ratio_z = c(0.6, 1.2)
+)
+
+images$is_proportional = apply(images[, c('ratio_x', 'ratio_y', 'ratio_z')], 1, function(r) {
+  all(r >= ref_thresholds$ratio_x[1] & r <= ref_thresholds$ratio_x[2]) &
+    all(r >= ref_thresholds$ratio_y[1] & r <= ref_thresholds$ratio_y[2]) &
+    all(r >= ref_thresholds$ratio_z[1] & r <= ref_thresholds$ratio_z[2])
+})
+
+# Logical mask for proportional dimensions
+# Set epsilon
+epsilon <- 0.025
+# images$is_proportional <- abs(ratio_xy - ref_xy) < epsilon &
+#                    abs(ratio_xz - ref_xz) < epsilon &
+#                    abs(ratio_yz - ref_yz) < epsilon
+
+
+
+# SNV: Changed to not repeat code you had above and use the same (more compact) syntax you used above
+images <- images %>% mutate(
+  dim_mm      = factor(dim_mm,      levels = names(sort(table(dim_mm),      decreasing = TRUE)))
+)
+
+prop_near_mni <- sum(images$is_proportional)
+mni_total <- length(images$is_proportional)
+
+
+# PLOT
+
+library(GGally)
+library(ggplot2)
+library(scales)
+library(rlang)
+
+# Create ratio dataframe
+ratio_df <- images[, c('ratio_x', 'ratio_y', 'ratio_z')]
+ratio_df <- na.omit(ratio_df)
+
+# Diagonal function (histograms)
+diag_fun_ratio <- function(data, mapping, ...) {
+  p <- GGally::ggally_barDiag(data, mapping, ...)
+  
+  var <- as_label(mapping$x)
+  thrs <- ref_thresholds[[var]]
+  
+  if (!is.null(thrs)) {
+    for (thr in thrs) {
+      p <- p + geom_vline(xintercept = thr, linetype = "dashed", color = "red", alpha = 0.7)
+    }
+  }
+  p
+}
+
+# Lower function (scatter plots)
+lower_fun_ratio <- function(data, mapping, ...) {
+  p <- GGally::ggally_points(data, mapping, ...)
+  
+  xvar <- as_label(mapping$x)
+  yvar <- as_label(mapping$y)
+  
+  x_thrs <- ref_thresholds[[xvar]]
+  y_thrs <- ref_thresholds[[yvar]]
+  
+  if (!is.null(x_thrs)) {
+    for (thr in x_thrs) {
+      p <- p + geom_vline(xintercept = thr, linetype = "dashed", color = "red", alpha = 0.7)
+    }
+  }
+  
+  if (!is.null(y_thrs)) {
+    for (thr in y_thrs) {
+      p <- p + geom_hline(yintercept = thr, linetype = "dashed", color = "red", alpha = 0.7)
+    }
+  }
+  
+  p
+}
+
+# Upper function (correlations)
+upper_fun_ratio <- function(data, mapping, ...) {
+  GGally::ggally_cor(data, mapping, ...) +
+    theme_void()
+}
+
+# Create the plot
+GGally::ggpairs(
+  ratio_df,
+  diag = list(continuous = diag_fun_ratio),
+  lower = list(continuous = lower_fun_ratio),
+  upper = list(continuous = upper_fun_ratio),
+  title = "Image dimension ratios (relative to MNI 182×218×182 template)"
+)
+```
+
+We convert the image dimensions to mm by multiplying the number of voxels by the pixel dimension.
+Using a proportionality tolerance of $\varepsilon$ = `r epsilon`, we then check whether the physical dimensions of each image are approximately proportional to the MNI template (182x218x182 mm).
+We find that `r prop_near_mni` of `r mni_total` images are approximately proportional to the MNI template.
+
+Images with a low intensity range (`abs(max - min)`) are unlikely to be valid statistical images, so we exclude all images that have a range smaller than 0.01.
+
+```{r 3_1, eval = TRUE, fig.width=15, fig.height=9, fig.cap="Scatter of range_diff (log10 scale) by index", warning=FALSE}
+library(stringr)
+library(ggplot2)
+library(scales)
+
+# SNV: removed loading and saving dataset in this chunk
+
+# parse [lo, hi]
+hi <- str_match(
+  images[["range"]],
+  "\\[\\s*([+-]?(?:\\d*\\.?\\d+(?:[eE][+-]?\\d+)?))\\s*,\\s*([+-]?(?:\\d*\\.?\\d+(?:[eE][+-]?\\d+)?))\\s*\\]"
+)
+lo <- as.numeric(hi[, 2])
+hi <- as.numeric(hi[, 3])
+
+# attach & compute range
+images$range_low  <- lo
+images$range_high <- hi
+images$range_diff <- images$range_high - images$range_low
+rm(lo, hi)
+
+# histogram of log10(range_diff) (positive values only)
+xpos <- images$range_diff
+# SNV: commented this because it was already satisfied.
+# xpos <- xpos[is.finite(xpos) & xpos > 0]
+
+# xpos already defined above as positive, finite range_diff values
+df_sc <- data.frame(
+  idx = seq_along(xpos),
+  l10 = log10(xpos)
+)
+
+tick_min <- floor(min(df_sc$l10, na.rm = TRUE))
+tick_max <- ceiling(max(df_sc$l10, na.rm = TRUE))
+ticks    <- tick_min:tick_max
+
+# SNV: changed hard coding of horizontal line
+# SNV: Change this to -2, since it is thresholding on the log scale
+thr <- -2
+ggplot(df_sc, aes(idx, l10)) +
+  geom_point(alpha = 0.5, size = 0.6) +
+  scale_y_continuous(breaks = ticks, labels = scales::math_format(10^.x)) +
+  geom_hline(yintercept = ticks, linetype = "dotted", linewidth = 0.3, color = "grey70") +
+  labs(
+    title = "Scatterplot of image range (log10 scale) by row index",
+    x = "Image index",
+    y = "Image numerical range (log10 scale)",
+    subtitle = sprintf("n = %d ", length(xpos))
+  ) +
+  geom_hline(yintercept = thr,linetype = "dashed", color = "red") + 
+  theme_minimal(base_size = 12)
+rm(df_sc)
+
+# drop rows with log10(range_diff) < 0.1 (guard against non-positive / NA)
+images$range_exclusion = log10(images$range_diff) < thr
+```
+
+
+
+```{r}
+# SNV: perc_of_voxels_outside was not included in table1Form, so I did not include it here.
+table2Form = update.formula(table1Form, ~ duplicated + is_proportional + range_exclusion + dim_mm + .)
+table1(table2Form, data = images, caption = "Table 4: Image-level exclusionary criteria (duplicated, is_proportional, range_exclusion) with prior metadata.")
+
+# SNV: table is created and then duplicates, nonproportional images, and images with tiny range are excluded.
+# Subset original data
+# 
+images <- images[which(images$is_proportional & !images$duplicated & !images$range_exclusion), ]
+dimtab = table(images$dim_mm); dimtab = dimtab[dimtab > 0]
+images$dim_mm = factor(images$dim_mm, levels = names(sort(dimtab,      decreasing = TRUE)))
+
+table1(table2Form, data = images, caption = "Table 5: After image-level exclusionary criteria with prior metadata.")
+```
+
+
+
+# Image value processing
+
+The above plot shows a histogram of proportion of nonzero voxels in each image. Note that some of the images have coverages 100%, this may happen because there are active voxels everywhere in the brain, or there could be voxels with extremely small values where it should instead be 0. In this section, we would 
+
+1. Remove all the NaN values in the images that causes FLIRT to fail and to remove values that are very close to zero due to prior registration artifact.
+2. To take care of the images with active voxels everywhere, we set a fixed $\varepsilon$ (0.001) here, to filter out voxels with values around zero by $\varepsilon$ in all images.
+
+This value was chosen by eroding the non-brain mask, defined below, and looking at a histogram of the 90th quantile of the values outside the brain.
+
+```{r 4_1}
+library(callr)
+
+# Define the image processing function
+process_images_c3d_fn <- function(images_data, n_cores, eps_val) {
+  library(parallel)
+  
+  # Create output filenames
+  images_data$localfileadj <- sub("\\.nii(\\.gz)?$", "_eps.nii.gz", 
+                                   images_data$localfile, ignore.case = TRUE)
+  
+  # Step 1: Convert NaN into zeros
+  cat(sprintf("[%s] [BG] Converting NaN to zeros...\n", Sys.time()))
+  cmd1 <- paste('/usr/local/c3d-1.1.0-Linux-x86_64/bin/c3d', 
+                images_data$localfile, '-replace NaN 0.0 -o', 
+                images_data$localfileadj)
+  invisible(mclapply(cmd1, function(c) system(paste(c, ">/dev/null")), 
+                     mc.cores = n_cores))
+  cat(sprintf("[%s] [BG] NaN conversion complete\n", Sys.time()))
+  
+  # Step 2: Apply threshold filter
+  cat(sprintf("[%s] [BG] Applying threshold filter (eps = %g)...\n", Sys.time(), eps_val))
+  cmd2 <- sprintf("%s %s -dup -threshold -%g %g 0 1 -multiply -o %s",
+                  shQuote("/usr/local/c3d-1.1.0-Linux-x86_64/bin/c3d"),
+                  shQuote(images_data$localfileadj), eps_val, eps_val, 
+                  shQuote(images_data$localfileadj))
+  invisible(mclapply(cmd2, function(c) system(paste(c, ">/dev/null")), 
+                     mc.cores = n_cores))
+  cat(sprintf("[%s] [BG] Threshold filtering complete\n", Sys.time()))
+  
+  # Return updated filenames
+  return(images_data$localfileadj)
+}
+
+# Create logfiles directory if needed
+logdir <- "logfiles"
+if (!dir.exists(logdir)) dir.create(logdir, showWarnings = FALSE)
+logfiles = c('logfiles/image_processing_c3d.log', 'logfiles/image_processing_c3d.err')
+unlink(logfiles)
+
+# Run and wait for completion
+# SNV: @copilot, should only run this if not run
+eps <- 1e-3
+cat(sprintf("[%s] Starting image processing (%d images)...\n", Sys.time(), nrow(images)))
+localfileadj_result <- callr::r(process_images_c3d_fn, 
+                                args = list(images, n_cores, eps),
+                                stdout = logfiles[1],
+                                stderr = logfiles[2])
+
+# Update images dataframe with processed filenames
+images$localfileadj <- localfileadj_result
+cat(sprintf("[%s] ✓ Image processing completed. Output: %s\n", Sys.time(), logfiles[1]))
+```
+
+#  Image realignment
+
+Despite the images being reported as MNI space. After visual inspection, we noticed they were not properly aligned with the MNI template. Examples of some misaligned images from the image dimension categories shown in Table 5 are shown in Figure 3.
+
+```{r fig-misaligned, echo=FALSE, warning=FALSE, fig.cap='Examples of image misalignment.'}
+knitr::include_graphics("resliced_snapshot.png")
+
+```
+
+To resolve image misalignment, we evaluated registration of varying complexity:
+
+* **Reslicing** – no registration is performed; the image is simply resampled into the MNI 2mm grid.
+* **Rigid registration (DOF = 6)** – allows only rotation and translation, preserving the original shape and scale of the brain.
+* **Affine registration (DOF = 12)** – adds scaling and shearing to the rigid transform.
+
+For both rigid and linear registrations, we use mutual information as the cost function (`-cost mutualinfo` using `FLIRT`) to accommodate differences in contrast and intensity between the template and statistical images.
+Results are shown for the seven most common image dimensions covering the majority of the dataset.
+
+```{r section3.2-function, eval=FALSE, fig.width=10, fig.height=20, warning=FALSE, message=FALSE, warning=FALSE}
+# SNV: I think this code chunk created the hardcoded image above.
+# Haozheng: This also makes the hardcoded images below in the tabset.
+stopifnot(exists("template"), file.exists(template))
+mni <- readNIfTI(template)
+
+images_subset <- load_monthly_rds("imageMetadataRegistered")
+images_subset$dim_mm <- as.character(images_subset$dim_mm)
+
+# @haozheng, this is hard coded, so should maybe be derived from the data directly
+images_subset_df <- as.data.frame(images_subset)
+dims_to_show <- images_subset_df %>%
+  count(dim_mm) %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 8) %>%      # take top 8 most frequent, adjust n as needed
+  pull(dim_mm)
+
+redmap <- colorRampPalette(c("blue","red","yellow"))(256)
+
+first_existing <- function(v) {
+  v <- v[!is.na(v)]
+  i <- which(file.exists(v))
+  if (length(i)) v[i[1]] else NA_character_
+}
+
+ortho2_grob <- function(bg, ovl, title, zlims) {
+  grid.echo(function() {
+    op <- par(mai = c(0.1, 0.1, 0.55, 0.2), cex.main = 0.75)
+    on.exit(par(op), add = TRUE)
+    ortho2(bg, ovl,
+           col.x = gray(0:64/64),
+           col.y = redmap,
+           text  = title,
+           text.cex = 0.8,
+           NA.x = TRUE, NA.y = TRUE,
+           ycolorbar = TRUE,
+           zlim.y = zlims)
+  })
+  grid.grab()
+}
+
+has_flirt <- nzchar(Sys.which("flirt"))
+
+grobs  <- list()
+labels <- character(0)
+
+for (d in dims_to_show) {
+  img_file <- first_existing(images_subset$localfile[images_subset$dim_mm == d])
+  if (is.na(img_file)) {
+    message("No files for dim_mm = ", d)
+    next
+  }
+
+  # initialize panels
+  gR <- gL <- gS <- ggplot() + theme_void() +
+    annotate("text", x = 0, y = 0, label = "No panel", size = 5)
+
+  if (!is.na(img_file) && has_flirt) {
+    out1 <- tempfile(fileext = "_rigid.nii.gz")
+    out2 <- tempfile(fileext = "_affine.nii.gz")
+    out3 <- tempfile(fileext = "_reslice.nii.gz")
+
+    # Rigid
+    system2("flirt", c("-in", img_file, "-ref", template,
+                       "-out", out1, "-dof", "6",
+                       "-cost", "mutualinfo", "-interp", "trilinear"))
+    if (file.exists(out1)) {
+      stat6 <- readNIfTI(out1)
+      z6 <- quantile(stat6, probs = c(0.7, 1.0), na.rm = TRUE)
+      stat6[stat6 < z6[1]] <- NA
+      gR <- ggdraw(ortho2_grob(mni, stat6,
+                paste0("Rigid (DOF=6) — \n", gsub("\\*", "×", d)), z6))
+    }
+
+    # Linear
+    system2("flirt", c("-in", img_file, "-ref", template,
+                       "-out", out2, "-dof", "12",
+                       "-cost", "mutualinfo", "-interp", "trilinear"))
+    if (file.exists(out2)) {
+      stat12 <- readNIfTI(out2)
+      z12 <- quantile(stat12, probs = c(0.7, 1.0), na.rm = TRUE)
+      stat12[stat12 < z12[1]] <- NA
+      gL <- ggdraw(ortho2_grob(mni, stat12,
+                paste0("Linear (DOF=12) — \n", gsub("\\*", "×", d)), z12))
+    }
+
+    # Reslice (2 mm isotropic)
+    system2("flirt", c("-in", img_file, "-ref", template,
+                       "-out", out3, "-applyisoxfm", "2",
+                       "-interp", "trilinear"))
+    if (file.exists(out3)) {
+      stat_reslice <- readNIfTI(out3)
+      z_reslice <- quantile(stat_reslice, probs = c(0.7, 1.0), na.rm = TRUE)
+      stat_reslice[stat_reslice < z_reslice[1]] <- NA
+      gS <- ggdraw(ortho2_grob(mni, stat_reslice,
+                paste0("Reslicing (2mm) — \n", gsub("\\*", "×", d)), z_reslice))
+    }
+  } else if (!has_flirt) {
+    gS <- gR <- gL <- ggplot() + theme_void() +
+      annotate("text", x = 0, y = 0, label = "FLIRT not found on PATH", size = 5)
+  }
+
+  # Save panels
+  row_plot <- plot_grid(gS, gR, gL, ncol = 3, greedy = FALSE)
+  grobs[[length(grobs) + 1]] <- row_plot
+  labels <- c(labels, gsub("\\*", "×", d))
+
+  outfile <- sprintf("registrations_%s.png", gsub("\\*", "x", d))
+  ggsave(outfile, row_plot, width = 15, height = 3, dpi = 1000, limitsize = FALSE)
+  message("Saved: ", outfile)
+}
+```
+
+
+## Registration snapshots {.tabset}
+
+```{r reg_tabs, echo=FALSE, results='asis', warning=FALSE}
+dir <- "/media/disk2/ree/metadataset" # The directory of saving the files
+
+pngs <- list.files(dir, pattern = "^registrations_.*\\.png$", full.names = TRUE)
+labs <- sub("^registrations_([0-9.]+x[0-9.]+x[0-9.]+)\\.png$", "\\1", basename(pngs))
+
+key <- strcapture("([0-9.]+)x([0-9.]+)x([0-9.]+)", labs,
+                  data.frame(a = double(), b = double(), c = double()))
+o <- do.call(order, as.list(key))
+pngs <- pngs[o]; labs <- labs[o]
+
+for (i in seq_along(pngs)) {
+  cat("### ", labs[i], "\n\n", sep = "")
+  cat(sprintf("![](%s){width=100%%}\n\n", pngs[i]))
+}
+```
+
+Based on these results, we chose rigid registration, as a balance between flexibility and accuracy across the image dimension categories.
+With the registered images, we further extracted information from the data:
+
+* `voxdim_new`: indicates the new voxel dimension of the images, now all images should be 2mm isotropic.
+* `imgdim_new`: indicates the new image dimension, now all images should be `91*109*91`.
+* `range_new`: indicates the new range of voxel intensity.
+
+
+
+## Run registration
+
+<!-- SNV: This chunk was set to not run. Doesn't that mean it won't update with new images? I changed it to eval=TRUE -->
+```{r section3.3, eval=TRUE}
+library(RNifti)
+library(callr)
+
+# Add resliced output filenames to dataframe (fast operation, no need for background)
+cat(sprintf("[%s] Adding resliced output filenames\n", Sys.time()))
+images$resliced <- gsub('.nii.gz', '_rigid_cost_step1.nii.gz', images$localfile)
+
+# Define the registration function to run in background
+register_images_fn <- function(images_data, template_path, n_cores, outdir) {
+  library(parallel)
+  
+  ## FSL Setup - Robust
+  if (!nzchar(Sys.which("flirt"))) {
+    if (!nzchar(Sys.getenv("FSLDIR"))) {
+      fsl_candidates <- c("/usr/local/fsl", "/usr/share/fsl", "/opt/fsl")
+      existing <- file.exists(fsl_candidates)
+      if (any(existing)) {
+        Sys.setenv(FSLDIR = fsl_candidates[which(existing)[1]])
+      } else {
+        stop("FSL not found. Please install FSL and set FSLDIR environment variable")
+      }
+    }
+    Sys.setenv(FSLOUTPUTTYPE = "NIFTI_GZ")
+    fslbin <- file.path(Sys.getenv("FSLDIR"), "bin")
+    Sys.setenv(PATH = paste(fslbin, Sys.getenv("PATH"), sep = ":"))
+  }
+  
+  ## Reference image
+  ref <- file.path(Sys.getenv("FSLDIR"), "data", "standard", "MNI152_T1_2mm_brain.nii.gz")
+  
+  ## Helpers
+  validate_flirt <- function() {
+    flirt <- Sys.which("flirt")
+    if (!nzchar(flirt)) stop("FLIRT not found in PATH")
+    if (system2(flirt, args = "-version", stdout = FALSE, stderr = FALSE) != 0) {
+      stop("FLIRT exists but failed to run. Please check FSL installation")
+    }
+    flirt
+  }
+  
+  flirt <- validate_flirt()
+  
+  reslice_image <- function(input, output, ref) {
+    if (!file.exists(output)) {
+      message(sprintf("[%s] Reslicing: %s", Sys.time(), basename(input)))
+      cmd <- sprintf("%s -in '%s' -ref '%s' -out '%s' -dof 6 -cost mutualinfo -interp trilinear",
+                     flirt, input, ref, output)
+      status <- system(cmd, ignore.stdout = TRUE, ignore.stderr = TRUE)
+      if (status != 0 || !file.exists(output) || file.size(output) == 0) {
+        warning("FLIRT failed for: ", input)
+        return(NA_character_)
+      }
+    }
+    return(output)
+  }
+  
+  ## Reslice all images
+  cat(sprintf("[%s] [BG] Starting reslicing with %d cores...\n", Sys.time(), n_cores))
+  results <- mcmapply(
+    FUN = reslice_image,
+    input = images_data$localfileadj,
+    output = images_data$resliced,
+    MoreArgs = list(ref = ref),
+    mc.cores = n_cores
+  )
+  
+  cat(sprintf("[%s] [BG] Image registration completed\n", Sys.time()))
+}
+
+# Create logfiles directory if needed
+logdir <- "logfiles"
+if (!dir.exists(logdir)) dir.create(logdir, showWarnings = FALSE)
+logfiles = c('logfiles/flirt_registration.log', 'logfiles/flirt_registration.err')
+unlink(logfiles)
+
+
+# Start background process - DON'T WAIT for completion
+bg_process <- callr::r(register_images_fn, 
+                          args = list(images, template, n_cores, outdir),
+                          stdout = logfiles[1],
+                          stderr = logfiles[2])
+
+message(sprintf("[%s] Background process started. Running image registration. Output: %s", 
+                Sys.time(), logfiles[1]))
+```
+
+
+
+```{r .3_extraction_and_coverage_computation, eval=TRUE}
+library(stringr)
+
+# Check if post-registration extraction and coverage data already exists this month
+rds_file_path <- get_monthly_rds_path("imageExtractionAndCoverage")
+file_exists_this_month <- file.exists(rds_file_path)
+
+if (!file_exists_this_month) {
+  # ============================================================================
+  # PART 1: FEATURE EXTRACTION FROM REGISTERED IMAGES
+  # ============================================================================
+  
+  # Count non-zero voxels with error handling
+  cmd_vox <- paste(c3d_bin, images$resliced, '-threshold 0 0 0 1 -voxel-sum')
+  nvox_result <- tryCatch({
+    unlist(mclapply(cmd_vox, function(cmd) {
+      tryCatch(system(cmd, intern = TRUE), error = function(e) "")
+    }, mc.cores = n_cores))
+  }, error = function(e) {
+    cat(sprintf("[%s] Warning: c3d voxel count failed\n", Sys.time()))
+    rep("", length(cmd_vox))
+  })
+  images$nvox_new <- as.numeric(gsub("[^0-9.]", "", nvox_result))
+  images$nvox_new[is.na(images$nvox_new)] <- NA
+  
+  # Extract new info with c3d -info
+  cat(sprintf("[%s] Extracting image info (voxdim, imgdim, orientation, range)...\n", Sys.time()))
+  cmd_info <- paste(c3d_bin, images$resliced, "-info")
+  info_result <- tryCatch({
+    mclapply(cmd_info, function(cmd) {
+      tryCatch(system(cmd, intern = TRUE), error = function(e) "")
+    }, mc.cores = n_cores)
+  }, error = function(e) {
+    cat(sprintf("[%s] Warning: c3d -info failed\n", Sys.time()))
+    rep(list(""), length(cmd_info))
+  })
+  
+  # Enhanced extractField function with error handling
+  extractField <- function(x, field_regex) {
+    tryCatch({
+      if (length(x) == 0 || all(x == "")) return(NA_character_)
+      line <- x[1]
+      if (is.na(line) || line == "") return(NA_character_)
+      match <- regmatches(line, regexpr(field_regex, line))
+      if (length(match) == 0) return(NA_character_)
+      return(match)
+    }, error = function(e) NA_character_)
+  }
+  
+  # Extract fields with safe mapping
+  cat(sprintf("[%s] Parsing extracted fields...\n", Sys.time()))
+  images$voxdim_new <- sapply(info_result, extractField, "vox = \\[.*?\\]")
+  images$imgdim_new <- sapply(info_result, extractField, "dim = \\[.*?\\]")
+  images$orient_new <- sapply(info_result, extractField, "orient = [A-Z]+")
+  images$range_new  <- sapply(info_result, extractField, "range = \\[.*?\\]")
+  
+  # Count how many extractions were successful
+  na_count <- sum(is.na(images$voxdim_new))
+  cat(sprintf("[%s] Extraction complete: %d successful, %d with missing/failed output\n", 
+              Sys.time(), nrow(images) - na_count, na_count))
+  
+  # ============================================================================
+  # PART 2: COMPUTE COVERAGE STATISTICS
+  # ============================================================================
+  
+  # Get files for coverage computation
+  files_all <- images$resliced
+  keep <- !is.na(files_all) & file.exists(files_all)
+  files <- files_all[keep]
+  idx   <- which(keep)
+  
+  # Function to compute mask overlap
+  maskOverlap = function(mask_path, files){
+    mask = readNifti(mask_path)
+    unlist(mclapply(files, function(file){
+      out = sum(readNifti(file)[ mask==1]!=0)
+    }, mc.cores = n_cores))
+  }
+  
+  # Compute coverage for different masks
+  nnz_outside = maskOverlap(nonbrain_mask, files)
+  nnz_gm = maskOverlap(gm_mask, files)
+  nnz_wm = maskOverlap(wm_mask, files)
+  
+  # Get minimum nonzero value in the brain complement
+  maskcomp = readNifti(nonbrain_eroded_mask)
+  q90_outside = unlist(mclapply(files, function(file){
+    out = abs(readNifti(file)[ maskcomp==1])
+    quantile(out, probs=0.9)
+  }, mc.cores = n_cores))
+  
+  # Write back to images (order-preserving; NAs for missing files)
+  images$nvox_outside[idx] <- nnz_outside
+  images$nvox_gm[idx]      <- nnz_gm
+  images$nvox_wm[idx]      <- nnz_wm
+  images$q90_outside[idx] = q90_outside
+  
+  # Save to versioned RDS file
+  if (!dir.exists(rds_dir)) dir.create(rds_dir, showWarnings = FALSE, recursive = TRUE)
+  rds_file_path <- get_monthly_rds_path("imageExtractionAndCoverage")
+  
+  cat(sprintf("[%s] Saving extracted features and coverage data to %s\n", Sys.time(), rds_file_path))
+  saveRDS(images, file = rds_file_path, compress = "gzip")
+  
+  cat(sprintf("[%s] ✓ Extraction and coverage data saved successfully\n", Sys.time()))
+} else {
+  # Load previously computed data
+  images <- load_monthly_rds("imageExtractionAndCoverage")
+  message("Loaded previously computed extraction and coverage data from ", rds_file_path)
+}
+
+# Plot histogram of q90_outside for reference
+#hist(log10(images$q90_outside[images$q90_outside>0]), xlab='log10(90th quantile)', main='90th image quantile')
+```
+
+
+
+## Exclusionary criteria based on template overlap
+
+After registration, we compute the proportion of voxels in the gray and white matter of the MNI template.
+Based on the histograms of these data, we selected thresholds for exclusion of images with poor coverage of the brain (e.g., due to incomplete registration or partial brain coverage in the original image) and visually evaluated images excluded to ensure the threshold wasn't discarding useful data.
+
+
+```{r .5.2, plot matrix of coverage, warning=FALSE}
+# thresholds
+GM_MIN  <- 100000
+WM_MIN  <- 20000
+OUT_MAX <- 100000
+
+GM_total <- sum(readNifti(gm_mask))
+WM_total <- sum(readNifti(wm_mask))
+
+out_total <- 91*109*91 - GM_total - WM_total
+images$gm_perc <- images$nvox_gm / GM_total
+images$wm_perc <- images$nvox_wm / WM_total
+images$outside_perc <- images$nvox_outside / out_total
+
+
+library(GGally)
+library(ggplot2)
+library(scales)
+library(rlang)
+
+# --- proportions already computed above ---
+coverage_df <- images[, c("gm_perc", "wm_perc", "outside_perc")]
+coverage_df <- na.omit(coverage_df)
+
+colnames(coverage_df) <- c("Gray Matter", "White Matter", "Outside Mask")
+
+# convert to percent for plotting
+coverage_pct <- coverage_df * 100
+
+# convert voxel-count thresholds to percent thresholds
+ref_pct <- c(
+  "Gray Matter"  = 100 * GM_MIN  / GM_total,
+  "White Matter" = 100 * WM_MIN  / WM_total,
+  "Outside Mask" = 100 * OUT_MAX / out_total
+)
+
+# formatter for axes
+pct_lab <- scales::label_percent(scale = 1, accuracy = 1)  # since data already in 0-100
+
+diag_fun <- function(data, mapping, ...) {
+  p <- GGally::ggally_barDiag(data, mapping, ...)
+  var <- as_label(mapping$x)
+  thr <- ref_pct[[var]]
+  if (!is.null(thr)) p <- p + geom_vline(xintercept = thr, linetype = "dashed")
+  p + scale_x_continuous(labels = pct_lab)
+}
+
+lower_fun <- function(data, mapping, ...) {
+  p <- GGally::ggally_points(data, mapping, ...)
+
+  xvar <- as_label(mapping$x)
+  yvar <- as_label(mapping$y)
+
+  # Reference identity line y = x
+  p <- p + geom_abline(
+    slope = 1, intercept = 0,
+    linetype = "solid", color = "black"
+  )
+
+  # Optional reference thresholds
+  if (!is.null(ref_pct[[xvar]]))
+    p <- p + geom_vline(xintercept = ref_pct[[xvar]], linetype = "dashed")
+
+  if (!is.null(ref_pct[[yvar]]))
+    p <- p + geom_hline(yintercept = ref_pct[[yvar]], linetype = "dashed")
+
+  p +
+    scale_x_continuous(labels = pct_lab) +
+    scale_y_continuous(labels = pct_lab)
+}
+
+upper_fun <- function(data, mapping, ...) {
+  GGally::ggally_cor(data, mapping, ...) +
+    theme_void()
+}
+
+GGally::ggpairs(
+  coverage_pct,
+  title = "Spatial Coverage Percentage",
+  upper = list(continuous = "cor"),
+  diag  = list(continuous = diag_fun),
+  lower = list(continuous = wrap(lower_fun, alpha = 0.35, size = 0.6))
+)
+
+
+```
+
+We perform further exclusions based on coverage information of the rigidly registered images based on the following metrics:
+
+1.  Proportion of nonzero voxels inside the gray matter above `r scales::percent(GM_MIN/GM_total)`.
+2.  Proportion of nonzero voxels inside the white matter above `r scales::percent(WM_MIN/WM_total)`.
+3.  Proportion of nonzero voxels outside gray and white below `r scales::percent(OUT_MAX/out_total)`.
+
+
+
+```{r .5.3 tableOfExclusions, warning=FALSE}
+# keep ONLY rows that pass all three checks (and are finite)
+images$gm_exclude = images$nvox_gm <= GM_MIN
+images$wm_exclude = images$nvox_wm <= WM_MIN
+images$nvox_outside_exclude = (images$nvox_outside >= OUT_MAX)
+
+# SNV: Hoazheng, to be consistent with the prior sections, lets use a table structure to show the exclusionary criteria
+table3Form = update.formula(table2Form, ~ gm_exclude + wm_exclude + nvox_outside_exclude + .)
+table1(table3Form, data=images)
+```
+
+
+```{r spot-check-generate, fig.height=15, fig.width=12, fig.cap='Visualization of images with low coverage of gray matter, white matter, and high percent of nonzero voxels outside the mask.'}
+## The following chunk finds out the ones that should be excluded, i.e. low coverage, and visualize them
+
+low_gm   <- images[which(images$gm_exclude == TRUE), ][1:4, ]
+low_wm   <- images[which(images$wm_exclude == TRUE), ][1:4, ]
+high_out <- images[which(images$nvox_outside_exclude == TRUE), ][1:4, ]
+
+spot_check <- rbind(low_gm, low_wm, high_out)
+spot_check$reason <- c(rep("Low gray matter", 4), 
+                       rep("Low white matter", 4), 
+                       rep("High outside mask", 4))
+
+par(mfrow = c(3, 4), mar = c(1, 1, 2.5, 1))
+tempBG = readNifti(template)
+for (i in seq_len(nrow(spot_check))) {
+  img <- readNifti(spot_check$resliced[i])
+  
+  mid_slice <- dim(img)[3] %/% 2
+  pbj:::image.niftiImage(img, BGimg=tempBG, lo=FALSE, index=35, limits=quantile(abs(img), probs=0.01), plane='sagittal')
+  # image(img[,,mid_slice], col = gray(0:64/64), axes = FALSE,
+  #       main = paste0(spot_check$reason[i], "\nGM: ",
+  #                     round(100 * spot_check$nvox_gm[i] / GM_total, 1), "%"))
+}
+
+# EXCLUSIONS ARE MADE HERE
+images <- images[which(!(images$gm_exclude | images$wm_exclude | images$nvox_outside_exclude)), ]
+```
+
+
+
+The following shows what the dataset looks like after excluding.
+```{r, warning=FALSE}
+# SNV: Changed to coverage_pct to be consistent
+# --- proportions already computed above ---
+coverage_df <- images[, c("gm_perc", "wm_perc", "outside_perc")]
+coverage_df <- na.omit(coverage_df)
+
+colnames(coverage_df) <- c("Gray Matter", "White Matter", "Outside Mask")
+
+# convert to percent for plotting
+coverage_pct <- coverage_df * 100
+
+GGally::ggpairs(
+  coverage_pct,
+  title = "Spatial Coverage Percentage",
+  upper = list(continuous = "cor"),
+  diag  = list(continuous = diag_fun),
+  lower = list(continuous = wrap(lower_fun, alpha = 0.35, size = 0.6))
+)
+
+```
+
+
+
+
+#  Effect size analysis and exclusionary criteria
+
+
+## Effect size estimation
+
+Here, we convert nonzero values in the T and Z statistical images into the signed version of the robust effect size index (RESI; using `RESI::t2S` for T maps and `RESI::z2S` for Z maps), based on each metadata sample size reported with the images.
+We save the resulting effect size images and summary statistics within gray and white matter (mean and 0, 0.25, 0.5, 0.75, 1 quantiles).
+
+<!-- SNV: Haozheng, this exclusion should be made in the prior section -->
+<!-- Given that registration of the prior step could potentially break some images, we perform a simple exclusion based on missingness of data entries. -->
+
+```{r .1_5.1, fig.width=12, fig.height=30, warning = FALSE}
+library(RNifti)
+library(callr)
+library(RESI)
+
+# SNV: We checked this unrealistic sample size and the correct number is 32
+images[ images$collection_id==12878, 'number_of_subjects'] = 32
+
+# Check if effect size computation was already done this month
+rds_file_path <- get_monthly_rds_path("imageMetadataEffectSizes")
+file_exists_this_month <- file.exists(rds_file_path)
+
+if (!file_exists_this_month) {
+  # Define the effect size computation function to run in background - function saves results internally
+  compute_and_save_effect_sizes_fn <- function(images_data, gm_mask_path, wm_mask_path, 
+                                              mask_2mm_path, n_cores, rds_dir) {
+    library(RNifti)
+    library(parallel)
+    library(RESI)
+    
+    # Helper function to get monthly RDS path
+    get_monthly_rds_path <- function(base_name, dir = rds_dir) {
+      get_date_suffix <- function() {
+        format(Sys.Date(), "%Y-%m")
+      }
+      date_suffix <- get_date_suffix()
+      current_file <- file.path(dir, paste0(base_name, "_", date_suffix, ".rds"))
+      
+      pattern <- paste0("^", base_name, "_[0-9]{4}-[0-9]{2}\\.rds$")
+      all_files <- list.files(dir, pattern = pattern, full.names = TRUE)
+      
+      old_files <- all_files[all_files != current_file]
+      if (length(old_files) > 0) {
+        invisible(lapply(old_files, file.remove))
+      }
+      
+      return(current_file)
+    }
+    
+    # Load masks once
+    gm_mask_nifti <- RNifti::readNifti(gm_mask_path)
+    wm_mask_nifti <- RNifti::readNifti(wm_mask_path)
+    brain_mask_nifti <- RNifti::readNifti(mask_2mm_path)
+    
+    # Validate that required columns exist
+    cat(sprintf("[%s] [BG] Starting effect size computation for %d images...\n", Sys.time(), nrow(images_data)))
+    
+    # Get indices of nonzero voxels once for efficiency
+    gm_idx   <- which(gm_mask_nifti != 0)
+    wm_idx   <- which(wm_mask_nifti != 0)
+    brain_idx <- which(brain_mask_nifti != 0)
+    
+    # Worker function that takes ALL arguments explicitly (no lexical scoping)
+    process_single_image <- function(idx, file_path, n_subj, map_type, gm_idx, wm_idx, brain_idx) {
+      tryCatch({
+        if (is.na(file_path) || !nzchar(file_path) || !file.exists(file_path)) return(NULL)
+        if (is.na(n_subj) || is.na(map_type)) return(NULL)
+        
+        img <- RNifti::readNifti(file_path)
+        
+        # Only extract nonzero values
+        nonzero_mask <- (img != 0) & !is.na(img)
+        valid_idx <- which(nonzero_mask)
+        
+        if (length(valid_idx) == 0) return(NULL)
+        
+        valid_vals <- img[valid_idx]
+        
+        # Convert map_type to character to handle factors
+        map_type_char <- as.character(map_type)
+        
+        # Convert effect sizes
+        if (map_type_char == "T map") {
+          converted <- RESI::t2S(valid_vals, rdf = n_subj - 1, n = n_subj)
+        } else if (map_type_char == "Z map") {
+          converted <- RESI::z2S(valid_vals, n = n_subj, unbiased = TRUE)
+        } else {
+          return(NULL)
+        }
+        
+        # Build effect size image only with converted values
+        effect_img <- img
+        effect_img[valid_idx] <- converted
+        effect_img[!is.finite(effect_img)] <- 0
+        
+        output_dir <- dirname(file_path)
+        if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+        base_name  <- sub("\\.nii\\.gz$", "", basename(file_path))
+        out_file   <- file.path(output_dir, paste0(base_name, "_effect_size.nii.gz"))
+        RNifti::writeNifti(effect_img, out_file)
+        
+        # Get stats from converted values only (not from full image)
+        effect_only <- converted[converted != 0 & is.finite(converted)]
+        es_stats <- if (length(effect_only) > 0) {
+          c(
+            quantile(effect_only, type = 7),
+            es_mean = mean(effect_only)
+          )
+        } else rep(NA_real_, 6)
+        
+        # Compute masked statistics using indices only (no intermediate arrays)
+        grey_vals  <- effect_img[gm_idx]
+        white_vals <- effect_img[wm_idx]
+        
+        # Write brain-masked version
+        brain_file <- sub("\\.nii\\.gz$", "_masked_mni.nii.gz", out_file)
+        brain_masked <- effect_img
+        brain_masked[-brain_idx] <- 0  # Zero out non-brain voxels
+        RNifti::writeNifti(brain_masked,  brain_file)
+        
+        list(
+          index       = idx,
+          effect_size_file = out_file,
+          brain_file = brain_file,
+          es_min      = es_stats[1],
+          es_1qt      = es_stats[2],
+          es_median   = es_stats[3],
+          es_3qt      = es_stats[4],
+          es_max      = es_stats[5],
+          es_mean     = es_stats[6],
+          grey_mean   = if (length(grey_vals)  > 0) mean(grey_vals[grey_vals != 0], na.rm = TRUE)  else NA_real_,
+          grey_min    = if (length(grey_vals)  > 0) min(grey_vals[grey_vals != 0], na.rm = TRUE)   else NA_real_,
+          grey_max    = if (length(grey_vals)  > 0) max(grey_vals[grey_vals != 0], na.rm = TRUE)   else NA_real_,
+          white_mean  = if (length(white_vals) > 0) mean(white_vals[white_vals != 0], na.rm = TRUE) else NA_real_,
+          white_min   = if (length(white_vals) > 0) min(white_vals[white_vals != 0], na.rm = TRUE)  else NA_real_,
+          white_max   = if (length(white_vals) > 0) max(white_vals[white_vals != 0], na.rm = TRUE)  else NA_real_
+        )
+      }, error = function(e) {
+        message(" [", Sys.time(), "] Skipping index ", idx, ": ", e$message)
+        NULL
+      })
+    }
+    
+    # Use mcmapply to pass only necessary vectors to workers (not entire environment)
+    cat(sprintf("[%s] [BG] Starting effect size computation for %d images...\n", Sys.time(), nrow(images_data)))
+    results <- mcmapply(
+      process_single_image,
+      idx = 1:nrow(images_data),
+      file_path = images_data$resliced,
+      n_subj = images_data$number_of_subjects,
+      map_type = images_data$map_type,
+      MoreArgs = list(gm_idx = gm_idx, wm_idx = wm_idx, brain_idx = brain_idx),
+      mc.cores = n_cores,
+      SIMPLIFY = FALSE
+    )
+    
+    # Filter and bind
+    cat(sprintf("[%s] Processing results...\n", Sys.time()))
+    results <- Filter(Negate(is.null), results)
+    df_results <- do.call(rbind, lapply(results, as.data.frame))
+    
+    # Add index column to images_data for matching
+    images_data$index <- 1:nrow(images_data)
+    
+    # merge keeping all of images, matched by index
+    images_data = merge(images_data, df_results, all.x=TRUE)
+    
+    # Remove the temporary index column (not in original)
+    images_data$index <- NULL
+    
+    # Save directly to versioned RDS file
+    if (!dir.exists(rds_dir)) dir.create(rds_dir, showWarnings = FALSE, recursive = TRUE)
+    rds_path <- get_monthly_rds_path("imageMetadataEffectSizes")
+    saveRDS(images_data, file = rds_path)
+    
+    cat(sprintf("[%s] Effect size computation completed. Results saved to %s\n", Sys.time(), rds_path))
+  }
+  
+  logdir <- "logfiles"
+  if (!dir.exists(logdir)) dir.create(logdir, showWarnings = FALSE)
+  logfiles = c('logfiles/effectSize_estimation.log', 'logfiles/effectSize_estimation.err')
+  unlink(logfiles)
+
+  # Start background process - DON'T WAIT for completion
+  bg_process <- callr::r(compute_and_save_effect_sizes_fn, 
+                            args = list(images, gm_mask, wm_mask, mask_2mm_file, n_cores, rds_dir),
+                            stdout = logfiles[1],
+                            stderr = logfiles[2])
+  
+  message(sprintf("[%s] Background process started, Effect size computation will be saved to %s", 
+            Sys.time(), rds_file_path))
+} else {
+  # Load already computed effect sizes
+  images <- load_monthly_rds("imageMetadataEffectSizes")
+  message("Loaded previously computed effect sizes from ", rds_file_path)
+}
+```
+
+## Meta-analysis outlier detection model
+
+ To screen for outlier images, we model the expected variability of these mean effect sizes as a function of (i) study sample size and (ii) voxel coverage, and flag observations that fall outside the implied funnel.
+The mean value of the effect size, $y_{ij}$, for image $j$ in collection $i$, is proportional to $n_i^{-1} V_i^{-2}$, where $n_i$ denotes the number of subjects (sample size) and $V_{ij}$ denotes the number of nonzero voxels in image $j$ (see [preprint](XX) for details).
+<!-- SNV: Haozheng, in the paper or the Appendix, you will have to explain this math (probably paper). Would add a url reference to the preprint when it's up. -->
+
+
+We fit an intercept-only linear mixed-effects model with a collection-specific random intercept:
+
+$$y_{ij} = \mu + u_{i} + \varepsilon_{ij},$$
+
+where $\mu$ is the grand mean effect size and $u_{i} \sim \mathcal{N}(0, \tau^2)$ captures between-collection heterogeneity.
+
+To account for heteroskedasticity across images, we model the residual variance using a power-of-covariates structure implemented via the $\texttt{varPower}$ variance function in $\texttt{nlme}$, and combine multiple variance components using \texttt{varComb}. Specifically, for study-level covariates $N_{ij}$ (sample size) and $V_{ij}$ (scaled voxel coverage), we assume
+
+$$\mathrm{Var}(\varepsilon_{ij}) = \sigma^2 \, |N_{ij}|^{2\delta_1} \, |V_{ij}|^{2\delta_2},$$
+
+so that residual variability decreases as $N$ and/or $V$ increase when $\delta_1 < 0$ and/or $\delta_2 < 0$.
+
+The total per-observation variance incorporates both residual and between-collection variability:
+
+$$\sigma_{ij}^2 = \tau^2 + \sigma^2 \, |N_{ij}|^{2\delta_1} \, |V_{ij}|^{2\delta_2}.$$
+
+This quantity represents the model-implied variance of observed mean effect sizes as a function of sample size and voxel coverage.
+
+We flag whole images as outliers if their deviation from the fitted grand mean exceeds a multiple of its modeled standard deviation:
+
+$$\bigl| y_{ij} - \hat{\mu} \bigr| > k \, \sigma_{ij},$$
+
+with $k = 3$.
+<!-- SNV: I don't think we should change anything, but just want to note a couple alternative
+strategies:
+(1) condition on the collection BLUP -- this would flag individual images if they are far from their collection mean. I don't think this is a good idea.
+(2) Flag collection outliers and image outliers separately, e.g. could exclude whole studies if most of their images seem to be very noisy. I don't think we need to do this either. -->
+<!-- Equivalently, outliers are defined as observations lying outside the funnel boundaries $\hat{\mu} \pm k \, SD_{ij}$. -->
+
+This criterion standardizes residuals across studies while accounting for heteroskedasticity and within-collection correlation.
+This outlier identification procedure was applied only to the gray matter mean effect sizes.
+To mitigate the effect of outliers on the model fit used for outlier identification, we windsorized the data at the 1st and 99th percentiles.
+We did this after noting that a few extreme image values had a huge effect on the residual variance.
+<!-- The same procedure was applied separately to gray matter and white matter mean effect sizes. -->
+
+<!-- These analyses serve both to validate the effect-size transformation and to provide a principled, model-based mechanism for identifying implausible images prior to downstream inference. While alternative filtering strategies were explored, we selected the mixed-effects variance modeling approach as the most statistically grounded and interpretable method for screening artifactual data points. A summary table consolidating key model estimates and variance components is provided below. -->
+
+
+```{r outlierModel, fig.width=15, fig.height=8, warning=FALSE, message=FALSE}
+# SNV: excludes missing es_mean -- effect size could not be computed?
+images = images[ !is.na(images$es_mean),]
+winsorize_vec <- function(x, probs = c(0.01, 0.99)) {
+  qs <- quantile(x, probs = probs, na.rm = TRUE, names = FALSE, type = 7)
+  x[x < qs[1]] <- qs[1]
+  x[x > qs[2]] <- qs[2]
+  x
+}
+
+# Load effect size data
+images$es_mean_winsorized <- winsorize_vec(images$es_mean)
+images$voxel_scaled <- images$nvox_new/1000
+
+m_power_winsorized <- lme(
+  es_mean_winsorized ~ 1,
+  random  = ~ 1 | collection_id,
+  weights = varComb(
+  varPower(form = ~ number_of_subjects),
+  varPower(form = ~ voxel_scaled)),
+  data    = images,
+  method  = "REML"
+)
+
+m_power_original <- lme(
+  es_mean ~ 1,
+  random  = ~ 1 | collection_id,
+  weights = varComb(
+  varPower(form = ~ number_of_subjects),
+  varPower(form = ~ voxel_scaled)),
+  data    = images,
+  method  = "REML"
+)
+
+summary(m_power_winsorized)
+summary(m_power_original)
+
+m_power <- m_power_winsorized
+```
+
+
+The following chunk uses the outlier boundaries, as described above, from the winsorized model to make exclusions. 
+```{r outlierModelExclusions}
+overall_effect <- as.numeric(fixef(m_power))                
+sigma2 <- sigma(m_power)^2                                   
+tau2   <- as.numeric(VarCorr(m_power)[1, "Variance"])    
+
+# varPower exponents (delta_n, delta_v)
+expParams <- intervals(m_power)$varStruct[, 2]
+delta_n <- expParams[1]
+delta_v <- expParams[2]
+
+images$se_model <- sqrt(
+  tau2 + sigma2 *
+    (images$number_of_subjects ^ (2*delta_n)) *
+    (images$voxel_scaled       ^ (2*delta_v))
+)
+
+# standardized residuals
+images$res_std <- residuals(m_power, type = "pearson")
+
+k <- 3
+images$outlier <- abs(images$es_mean - overall_effect) > k * images$se_model
+
+# SNV: These are all satisfied already in the dataset
+# dat_plot <- subset(
+#   images,
+#   is.finite(number_of_subjects) & number_of_subjects > 0 &
+#     is.finite(es_mean) & is.finite(se_model)
+# )
+n_out <- sum(images$outlier)
+n_tot <- nrow(images)
+
+grid <- data.frame(
+  number_of_subjects = seq(1, 10000, length.out = 800)
+)
+
+# choose a constant voxel_scaled for the band (median is a sensible default)
+grid$voxel_scaled <- median(images$voxel_scaled, na.rm = TRUE)
+
+grid$se_model <- sqrt(
+  tau2 + sigma2 *
+    (grid$number_of_subjects ^ (2*delta_n)) *
+    (grid$voxel_scaled       ^ (2*delta_v))
+)
+
+grid$upper <- overall_effect + k * grid$se_model
+grid$lower <- overall_effect - k * grid$se_model
+grid$log_n <- log10(grid$number_of_subjects)
+
+library(plotly)
+
+# SNV: dat_plot was the same as images, just replace it here
+# dat_plot$se_model <- sqrt(
+#   tau2 + sigma2 *
+#     (dat_plot$number_of_subjects ^ (2 * delta_n)) *
+#     (dat_plot$voxel_scaled       ^ (2 * delta_v))
+# )
+# dat_plot$upper_bound <- overall_effect + k * dat_plot$se_model
+# dat_plot$lower_bound <- overall_effect - k * dat_plot$se_model
+# 
+# dat_plot$outlier <- with(dat_plot, es_mean > upper_bound | es_mean < lower_bound)
+
+n_seq <- 10^seq(0, 4, length.out = 60)
+v_seq <- seq(
+  quantile(images$voxel_scaled, 0.05, na.rm = TRUE),
+  quantile(images$voxel_scaled, 0.95, na.rm = TRUE),
+  length.out = 60
+)
+
+grid3d <- expand.grid(number_of_subjects = n_seq, voxel_scaled = v_seq)
+
+grid3d$se_model <- sqrt(
+  tau2 + sigma2 *
+    (grid3d$number_of_subjects ^ (2 * delta_n)) *
+    (grid3d$voxel_scaled       ^ (2 * delta_v))
+)
+
+grid3d$upper <- overall_effect + k * grid3d$se_model
+grid3d$lower <- overall_effect - k * grid3d$se_model
+
+
+xg <- log10(n_seq) 
+yg <- v_seq        
+
+UP <- t(matrix(grid3d$upper, nrow = length(n_seq), ncol = length(v_seq)))
+LO <- t(matrix(grid3d$lower, nrow = length(n_seq), ncol = length(v_seq)))
+MU <- matrix(overall_effect, nrow = length(yg), ncol = length(xg))
+
+plot_ly() |>
+  add_markers(
+    data = subset(images, !outlier),
+    x = ~log10(number_of_subjects),
+    y = ~voxel_scaled,
+    z = ~es_mean,
+    marker = list(size = 2, opacity = 0.25, color = "gray"),
+    name = "Inside funnel"
+  ) |>
+  add_markers(
+    data = subset(images, outlier),
+    x = ~log10(number_of_subjects),
+    y = ~voxel_scaled,
+    z = ~es_mean,
+    marker = list(size = 4, color = "red"),
+    name = "Outliers"
+  ) |>
+  add_surface(
+    x = xg, y = yg, z = MU,
+    opacity = 0.35,
+    name = "Overall effect (mu)"
+  ) |>
+  add_surface(
+    x = xg, y = yg, z = UP,
+    opacity = 0.20,
+    showscale = FALSE,
+    name = "Upper (mu + k·SD)"
+  ) |>
+  add_surface(
+    x = xg, y = yg, z = LO,
+    opacity = 0.20,
+    showscale = FALSE,
+    name = "Lower (mu - k·SD)"
+  ) |>
+  layout(
+    scene = list(
+      xaxis = list(title = "log10(sample size)"),
+      yaxis = list(title = "voxel_scaled (nonzero voxels / 1e5)"),
+      zaxis = list(title = "Effect size mean")
+    )
+  )
+```
+
+## Model refit with cleaned dataset
+With the above exclusion, a new dataset is created with the outliers as defined from the model above excluded. The following chunk refits the model with the new subset without Windsorization. Outliers are identified using the same procedure, but not excluded.
+<!-- SNV: Haozheng, I think this plot looks pretty good. The outliers don't look to be separated from the distribution here. -->
+
+```{r preOutlier}
+# Summary table for the final curated dataset using table1 for consistency
+table1( ~ outlier + number_of_subjects + es_mean + voxel_scaled + gm_perc + wm_perc + outside_perc + grey_mean + white_mean, 
+        data = images, 
+        caption = "Table: Summary statistics for the final curated Neurovault dataset before outlier exclusions.")
+```
+
+```{r cleanRefit}
+dat = images[ images$outlier==FALSE,]
+m_power <- lme(
+  es_mean ~ 1,
+  random  = ~ 1 | collection_id,
+  weights = varComb(
+  varPower(form = ~ number_of_subjects),
+  varPower(form = ~ voxel_scaled)),
+  data    = dat,
+  method  = "REML"
+)
+
+overall_effect <- as.numeric(fixef(m_power))                
+sigma2 <- sigma(m_power)^2                                   
+tau2   <- as.numeric(VarCorr(m_power)[1, "Variance"])    
+
+# varPower exponents (delta_n, delta_v)
+expParams <- intervals(m_power)$varStruct[, 2]
+delta_n <- expParams[1]
+delta_v <- expParams[2]
+
+dat$se_model <- sqrt(
+  tau2 + sigma2 *
+    (dat$number_of_subjects ^ (2*delta_n)) *
+    (dat$voxel_scaled       ^ (2*delta_v))
+)
+
+# standardized residuals (optional panel A)
+dat$res_std <- residuals(m_power, type = "pearson")
+
+k <- 3
+dat$outlier <- abs(dat$es_mean - overall_effect) > k * dat$se_model
+
+# dat_plot <- subset(
+#   dat,
+#   is.finite(number_of_subjects) & number_of_subjects > 0 &
+#     is.finite(es_mean) & is.finite(se_model)
+# )
+# dat_sorted <- dat_plot[order(dat_plot$number_of_subjects), ]
+# dat_clean  <- subset(dat_sorted, !outlier)
+# n_out <- sum(dat_plot$outlier)
+# n_tot <- nrow(dat_plot)
+# dat_plot$se_model <- sqrt(
+#   tau2 + sigma2 *
+#     (dat_plot$number_of_subjects ^ (2 * delta_n)) *
+#     (dat_plot$voxel_scaled       ^ (2 * delta_v))
+# )
+# dat_plot$upper_bound <- overall_effect + k * dat_plot$se_model
+# dat_plot$lower_bound <- overall_effect - k * dat_plot$se_model
+# dat_plot$outlier <- with(dat_plot, es_mean > upper_bound | es_mean < lower_bound)
+
+grid <- data.frame(
+  number_of_subjects = seq(1, 10000, length.out = 800)
+)
+
+# choose a constant voxel_scaled for the band (median is a sensible default)
+grid$voxel_scaled <- median(dat$voxel_scaled, na.rm = TRUE)
+
+grid$se_model <- sqrt(
+  tau2 + sigma2 *
+    (grid$number_of_subjects ^ (2*delta_n)) *
+    (grid$voxel_scaled       ^ (2*delta_v))
+)
+
+grid$upper <- overall_effect + k * grid$se_model
+grid$lower <- overall_effect - k * grid$se_model
+grid$log_n <- log10(grid$number_of_subjects)
+
+library(plotly)
+
+
+n_seq <- 10^seq(0, 4, length.out = 60)
+v_seq <- seq(
+  quantile(dat$voxel_scaled, 0.05, na.rm = TRUE),
+  quantile(dat$voxel_scaled, 0.95, na.rm = TRUE),
+  length.out = 60
+)
+
+grid3d <- expand.grid(number_of_subjects = n_seq, voxel_scaled = v_seq)
+
+grid3d$se_model <- sqrt(
+  tau2 + sigma2 *
+    (grid3d$number_of_subjects ^ (2 * delta_n)) *
+    (grid3d$voxel_scaled       ^ (2 * delta_v))
+)
+
+grid3d$upper <- overall_effect + k * grid3d$se_model
+grid3d$lower <- overall_effect - k * grid3d$se_model
+
+
+xg <- log10(n_seq) 
+yg <- v_seq        
+
+UP <- t(matrix(grid3d$upper, nrow = length(n_seq), ncol = length(v_seq)))
+LO <- t(matrix(grid3d$lower, nrow = length(n_seq), ncol = length(v_seq)))
+MU <- matrix(overall_effect, nrow = length(yg), ncol = length(xg))
+
+plot_ly() |>
+  add_markers(
+    data = subset(dat, !outlier),
+    x = ~log10(number_of_subjects),
+    y = ~voxel_scaled,
+    z = ~es_mean,
+    marker = list(size = 2, opacity = 0.25, color = "gray"),
+    name = "Inside funnel"
+  ) |>
+  add_markers(
+    data = subset(dat, outlier),
+    x = ~log10(number_of_subjects),
+    y = ~voxel_scaled,
+    z = ~es_mean,
+    marker = list(size = 4, color = "red"),
+    name = "Outliers"
+  ) |>
+  add_surface(
+    x = xg, y = yg, z = MU,
+    opacity = 0.35,
+    name = "Overall effect (mu)"
+  ) |>
+  add_surface(
+    x = xg, y = yg, z = UP,
+    opacity = 0.20,
+    showscale = FALSE,
+    name = "Upper (mu + k·SD)"
+  ) |>
+  add_surface(
+    x = xg, y = yg, z = LO,
+    opacity = 0.20,
+    showscale = FALSE,
+    name = "Lower (mu - k·SD)"
+  ) |>
+  layout(
+    scene = list(
+      xaxis = list(title = "log10(sample size)"),
+      yaxis = list(title = "voxel_scaled (nonzero voxels / 1e5)"),
+      zaxis = list(title = "Effect size mean")
+    )
+  )
+
+# Save the final curated dataset (after outlier exclusions)
+images <- dat
+saveRDS(images,  get_monthly_rds_path('curatedMetadataset'))
+
+```
+
+
+# Table summary of the three LMMs
+We have fit three models to evaluate outliers:
+
+* LMM on raw data.
+* LMM on winsorized data (used for outlier identification).
+* LMM on outlier-excluded subset.
+
+In this section, we have the model outputs of the three LMMs (original, winsorized, and cleaned) placed together to compare fixed and random effects parameters.
+
+```{r tablesummary}
+library(dplyr)
+library(knitr)
+library(kableExtra)
+library(nlme)
+library(tidyr)
+
+# Extract fixed and random effects parameters from the three models
+extract_model_params <- function(fit, model_name) {
+  fixef_val <- as.numeric(fixef(fit))
+  tau2 <- as.numeric(VarCorr(fit)[1, "Variance"])
+  sigma2 <- sigma(fit)^2
+  
+  expParams <- intervals(fit)$varStruct[, 2]
+  delta_n <- expParams[1]
+  delta_v <- expParams[2]
+  
+  # Convert variances to standard deviations
+  tau_sd <- sqrt(tau2)
+  sigma_sd <- sqrt(sigma2)
+  
+  data.frame(
+    Model = model_name,
+    Parameter = c("Fixed effect (intercept)", "Random effect SD (tau)", "Residual SD (sigma)", "delta_n", "delta_v"),
+    Estimate = c(fixef_val, tau_sd, sigma_sd, delta_n, delta_v),
+    stringsAsFactors = FALSE
+  )
+}
+
+# Extract parameters from all three models
+params_combined <- bind_rows(
+  extract_model_params(m_power_original, "Original"),
+  extract_model_params(m_power_winsorized, "Winsorized"),
+  extract_model_params(m_power, "Cleaned")
+)
+
+# Format the table
+tab_display <- params_combined %>%
+  pivot_wider(
+    names_from = Model,
+    values_from = Estimate
+  ) %>%
+  mutate(
+    across(c(Original, Winsorized, Cleaned), function(x) {
+      case_when(
+        grepl("Fixed effect", Parameter) ~ sprintf("%.3f", x),
+        grepl("Residual SD", Parameter) ~ sprintf("%.2e", x),
+        grepl("delta", Parameter) ~ sprintf("%.3f", x),
+        TRUE ~ sprintf("%.4f", x)
+      )
+    })
+  )
+
+kable(
+  tab_display,
+  format = "html",
+  escape = FALSE,
+  col.names = c("Parameter", "Original", "Winsorized", "Cleaned"),
+  caption = "Fixed and random effects parameter estimates from the three mixed-effects models."
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+
+# Summary of the curated Neurovault dataset
+```{r curation_summary}
+# Summary table for the final curated dataset using table1 for consistency
+table1( ~ number_of_subjects + es_mean + voxel_scaled + gm_perc + wm_perc + outside_perc + grey_mean + white_mean, 
+        data = images, 
+        caption = "Table: Summary statistics for the final curated Neurovault dataset after outlier exclusions.")
+
+```
+
+
+
+```{r zenodo api and dataset compressing, eval = FALSE}
+setwd("/media/disk2/ree/metadataset")
+library("remotes")
+
+#install_github("eblondel/zen4R")
+library(zen4R)
+outdir <- "/media/big/neurovault"
+
+img_paths <- images$localfile
+img_paths <- img_paths[!is.na(img_paths) & nzchar(img_paths)]
+img_paths <- img_paths[file.exists(img_paths)]
+
+outdir_abs <- normalizePath(outdir)
+img_abs <- normalizePath(img_paths)
+
+inside <- startsWith(img_abs, paste0(outdir_abs, .Platform$file.sep))
+img_abs <- img_abs[inside]
+
+rel_paths <- sub(
+  paste0("^", outdir_abs, .Platform$file.sep),
+  "",
+  img_abs
+)
+
+archive <- "/media/big/neurovault_subset.tar"
+
+old <- setwd(outdir)
+on.exit(setwd(old), add = TRUE)
+
+utils::tar(
+  tarfile = archive,
+  files = rel_paths,
+  compression = "none"
+)
+
+cat("Archive complete:", archive, "\n")
+
+#token <- "confidential" # this is confidential information
+
+# Note: Save token to rds_dir/zenodo_token.rds
+# saveRDS(token, file.path(rds_dir, "zenodo_token.rds"))
+
+zenodo <- ZenodoManager$new()
+# Note: Store zenodo_token.rds in rds_dir for consistency
+token_path <- file.path(rds_dir, "zenodo_token.rds")
+if (!file.exists(token_path)) {
+  stop("zenodo_token.rds not found in ", rds_dir, " directory")
+}
+token <- readRDS(token_path)
+
+zenodo <- ZenodoManager$new(
+   token = token, 
+   logger = "INFO" 
+)
+
+myrec <- zenodo$createEmptyRecord()
+
+
+myrec$setTitle("A Curated Meta-analytic Neuroimaging Dataset from Neurovault")
+myrec$setDescription("A description of my publication")
+myrec$addCreator(firstname = "Haozheng", lastname = "Xu", affiliation = "Vanderbilt University")
+myrec$setLicense("mit")
+myrec$setKeywords(c("R","package","software"))
+
+myrec <- zenodo$depositRecord(myrec)
+zenodo$uploadFile("/media/big/neurovault_subset.tar", myrec)
+zenodo$uploadFile("/media/disk2/ree/metadataset/dat_clean_from_refit_final.rds", myrec)
+myrec_files <- zenodo$getFiles(myrec$id)
+```
+
+
+(appendix)=
+# Appendix
+
+## Collection-level variables
+
+<!-- SNV: add names(nv) -->
+
+## Image-level variables
+
+<!-- SNV: add names() of the image-level variables -->
+
+## Session information
+
+```{r}
+sessionInfo()
+```
+
